@@ -138,3 +138,18 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# --- VHS Pipeline Specifics ---
+# Machine learning models
+models/
+
+# RIFE binaries and archives
+rife-ncnn-vulkan
+rife-ncnn-vulkan-20221029-ubuntu/
+rife-ncnn-vulkan-20221029-ubuntu.zip
+
+# Pipeline temporary processing data
+processing_chunks/
+
+# Output videos
+outputs/

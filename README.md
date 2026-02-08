@@ -1,272 +1,183 @@
-<p align="center">
-  <img src="assets/realesrgan_logo.png" height=120>
-</p>
+# VHS Enhancement Pipeline: Upscaling & Interpolation
 
-## <div align="center"><b><a href="README.md">English</a> | <a href="README_CN.md">简体中文</a></b></div>
+This project provides an automated, chunk-based pipeline for enhancing low-resolution VHS footage. It utilizes **Real-ESRGAN** for spatial upscaling and **RIFE** for temporal interpolation, featuring a specialized "Auto-Tuning" system to manage processing on consumer-grade hardware with limited disk space.
 
-<div align="center">
+## 1. Reference Specifications
 
-👀[**Demos**](#-demos-videos) **|** 🚩[**Updates**](#-updates) **|** ⚡[**Usage**](#-quick-inference) **|** 🏰[**Model Zoo**](docs/model_zoo.md) **|** 🔧[Install](#-dependencies-and-installation)  **|** 💻[Train](docs/Training.md) **|** ❓[FAQ](docs/FAQ.md) **|** 🎨[Contribution](docs/CONTRIBUTING.md)
+This pipeline was developed using digitized NTSC VHS footage with the following baseline:
 
-[![download](https://img.shields.io/github/downloads/xinntao/Real-ESRGAN/total.svg)](https://github.com/xinntao/Real-ESRGAN/releases)
-[![PyPI](https://img.shields.io/pypi/v/realesrgan)](https://pypi.org/project/realesrgan/)
-[![Open issue](https://img.shields.io/github/issues/xinntao/Real-ESRGAN)](https://github.com/xinntao/Real-ESRGAN/issues)
-[![Closed issue](https://img.shields.io/github/issues-closed/xinntao/Real-ESRGAN)](https://github.com/xinntao/Real-ESRGAN/issues)
-[![LICENSE](https://img.shields.io/github/license/xinntao/Real-ESRGAN.svg)](https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE)
-[![python lint](https://github.com/xinntao/Real-ESRGAN/actions/workflows/pylint.yml/badge.svg)](https://github.com/xinntao/Real-ESRGAN/blob/master/.github/workflows/pylint.yml)
-[![Publish-pip](https://github.com/xinntao/Real-ESRGAN/actions/workflows/publish-pip.yml/badge.svg)](https://github.com/xinntao/Real-ESRGAN/blob/master/.github/workflows/publish-pip.yml)
+* **Resolution**: 352x240.
+* **Frame Rate**: 29.97 fps.
+* **Scan Type**: The AI models require **progressive** input. Interlaced source (480i) must be de-interlaced first to avoid AI artifacts.
 
-</div>
+## 2. Key Features
 
-🔥 **AnimeVideo-v3 model (动漫视频小模型)**. Please see [[*anime video models*](docs/anime_video_model.md)] and [[*comparisons*](docs/anime_comparisons.md)]<br>
-🔥 **RealESRGAN_x4plus_anime_6B** for anime images **(动漫插图模型)**. Please see [[*anime_model*](docs/anime_model.md)]
+* **Dynamic Auto-Tuning**: Automatically calculates optimal chunk durations (10s–120s) by polling available disk space and estimating temporary file sizes.
+* **Aggressive Resource Management**: Processes video in segments; temporary frames for a chunk are deleted immediately after that chunk is processed, keeping the total disk footprint minimal.
+* **VHS-Optimized Pre-filtering**: Applies `hqdn3d` (denoise), `pp=ac` (deblock), and `unsharp` via FFmpeg to clean signals before upscaling.
+* **Lossless Metadata Injection**: Includes utilities to mux OGM-formatted chapters into the final MKV container without re-encoding.
 
-<!-- 1. You can try in our website: [ARC Demo](https://arc.tencent.com/en/ai-demos/imgRestore) (now only support RealESRGAN_x4plus_anime_6B) -->
-1. :boom: **Update** online Replicate demo: [![Replicate](https://img.shields.io/static/v1?label=Demo&message=Replicate&color=blue)](https://replicate.com/xinntao/realesrgan)
-1. Online Colab demo for Real-ESRGAN: [![Colab](https://img.shields.io/static/v1?label=Demo&message=Colab&color=orange)](https://colab.research.google.com/drive/1k2Zod6kSHEvraybHl50Lys0LerhyTMCo?usp=sharing) **|** Online Colab demo for for Real-ESRGAN (**anime videos**): [![Colab](https://img.shields.io/static/v1?label=Demo&message=Colab&color=orange)](https://colab.research.google.com/drive/1yNl9ORUxxlL4N0keJa2SEPB61imPQd1B?usp=sharing)
-1. Portable [Windows](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip) / [Linux](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip) / [MacOS](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-macos.zip) **executable files for Intel/AMD/Nvidia GPU**. You can find more information [here](#portable-executable-files-ncnn). The ncnn implementation is in [Real-ESRGAN-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan)
-<!-- 1. You can watch enhanced animations in [Tencent Video](https://v.qq.com/s/topic/v_child/render/fC4iyCAM.html). 欢迎观看[腾讯视频动漫修复](https://v.qq.com/s/topic/v_child/render/fC4iyCAM.html) -->
+## 3. External Dependencies
 
-Real-ESRGAN aims at developing **Practical Algorithms for General Image/Video Restoration**.<br>
-We extend the powerful ESRGAN to a practical restoration application (namely, Real-ESRGAN), which is trained with pure synthetic data.
+The following components are required but are not included in the repository. They must be downloaded and placed in the project root.
 
-🌌 Thanks for your valuable feedbacks/suggestions. All the feedbacks are updated in [feedback.md](docs/feedback.md).
+### Binaries
 
----
+* **RIFE-ncnn-vulkan**: Required for frame interpolation. Run the following commands in the project root to install:
+```bash
+wget https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-ubuntu.zip
+unzip rife-ncnn-vulkan-20221029-ubuntu.zip
+ln -s rife-ncnn-vulkan-20221029-ubuntu rife-ncnn-vulkan
+chmod u+x rife-ncnn-vulkan/rife-ncnn-vulkan
 
-If Real-ESRGAN is helpful, please help to ⭐ this repo or recommend it to your friends 😊 <br>
-Other recommended projects:<br>
-▶️ [GFPGAN](https://github.com/TencentARC/GFPGAN): A practical algorithm for real-world face restoration <br>
-▶️ [BasicSR](https://github.com/xinntao/BasicSR): An open-source image and video restoration toolbox<br>
-▶️ [facexlib](https://github.com/xinntao/facexlib): A collection that provides useful face-relation functions.<br>
-▶️ [HandyView](https://github.com/xinntao/HandyView): A PyQt5-based image viewer that is handy for view and comparison <br>
-▶️ [HandyFigure](https://github.com/xinntao/HandyFigure): Open source of paper figures <br>
+```
 
----
 
-### 📖 Real-ESRGAN: Training Real-World Blind Super-Resolution with Pure Synthetic Data
+* **MKVToolNix (`mkvmerge`)**: Required for the final muxing stage.
+* **Installation**: `sudo apt install mkvtoolnix` (Ubuntu/Debian).
 
-> [[Paper](https://arxiv.org/abs/2107.10833)] &emsp; [[YouTube Video](https://www.youtube.com/watch?v=fxHWoDSSvSc)] &emsp; [[B站讲解](https://www.bilibili.com/video/BV1H34y1m7sS/)] &emsp; [[Poster](https://xinntao.github.io/projects/RealESRGAN_src/RealESRGAN_poster.pdf)] &emsp; [[PPT slides](https://docs.google.com/presentation/d/1QtW6Iy8rm8rGLsJ0Ldti6kP-7Qyzy6XL/edit?usp=sharing&ouid=109799856763657548160&rtpof=true&sd=true)]<br>
-> [Xintao Wang](https://xinntao.github.io/), Liangbin Xie, [Chao Dong](https://scholar.google.com.hk/citations?user=OSDCB0UAAAAJ), [Ying Shan](https://scholar.google.com/citations?user=4oXBp9UAAAAJ&hl=en) <br>
-> [Tencent ARC Lab](https://arc.tencent.com/en/ai-demos/imgRestore); Shenzhen Institutes of Advanced Technology, Chinese Academy of Sciences
 
-<p align="center">
-  <img src="assets/teaser.jpg">
-</p>
 
----
+### Pre-trained Models (.pth)
 
-<!---------------------------------- Updates --------------------------->
-## 🚩 Updates
-
-- ✅ Add the **realesr-general-x4v3** model - a tiny small model for general scenes. It also supports the **-dn** option to balance the noise (avoiding over-smooth results). **-dn** is short for denoising strength.
-- ✅ Update the **RealESRGAN AnimeVideo-v3** model. Please see [anime video models](docs/anime_video_model.md) and [comparisons](docs/anime_comparisons.md) for more details.
-- ✅ Add small models for anime videos. More details are in [anime video models](docs/anime_video_model.md).
-- ✅ Add the ncnn implementation [Real-ESRGAN-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan).
-- ✅ Add [*RealESRGAN_x4plus_anime_6B.pth*](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth), which is optimized for **anime** images with much smaller model size. More details and comparisons with [waifu2x](https://github.com/nihui/waifu2x-ncnn-vulkan) are in [**anime_model.md**](docs/anime_model.md)
-- ✅ Support finetuning on your own data or paired data (*i.e.*, finetuning ESRGAN). See [here](docs/Training.md#Finetune-Real-ESRGAN-on-your-own-dataset)
-- ✅ Integrate [GFPGAN](https://github.com/TencentARC/GFPGAN) to support **face enhancement**.
-- ✅ Integrated to [Huggingface Spaces](https://huggingface.co/spaces) with [Gradio](https://github.com/gradio-app/gradio). See [Gradio Web Demo](https://huggingface.co/spaces/akhaliq/Real-ESRGAN). Thanks [@AK391](https://github.com/AK391)
-- ✅ Support arbitrary scale with `--outscale` (It actually further resizes outputs with `LANCZOS4`). Add *RealESRGAN_x2plus.pth* model.
-- ✅ [The inference code](inference_realesrgan.py) supports: 1) **tile** options; 2) images with **alpha channel**; 3) **gray** images; 4) **16-bit** images.
-- ✅ The training codes have been released. A detailed guide can be found in [Training.md](docs/Training.md).
-
----
-
-<!---------------------------------- Demo videos --------------------------->
-## 👀 Demos Videos
-
-#### Bilibili
-
-- [大闹天宫片段](https://www.bilibili.com/video/BV1ja41117zb)
-- [Anime dance cut 动漫魔性舞蹈](https://www.bilibili.com/video/BV1wY4y1L7hT/)
-- [海贼王片段](https://www.bilibili.com/video/BV1i3411L7Gy/)
-
-#### YouTube
-
-## 🔧 Dependencies and Installation
-
-- Python >= 3.7 (Recommend to use [Anaconda](https://www.anaconda.com/download/#linux) or [Miniconda](https://docs.conda.io/en/latest/miniconda.html))
-- [PyTorch >= 1.7](https://pytorch.org/)
-
-### Installation
-
-1. Clone repo
-
-    ```bash
-    git clone https://github.com/xinntao/Real-ESRGAN.git
-    cd Real-ESRGAN
-    ```
-
-1. Install dependent packages
-
-    ```bash
-    # Install basicsr - https://github.com/xinntao/BasicSR
-    # We use BasicSR for both training and inference
-    pip install basicsr
-    # facexlib and gfpgan are for face enhancement
-    pip install facexlib
-    pip install gfpgan
-    pip install -r requirements.txt
-    python setup.py develop
-    ```
-
----
-
-## ⚡ Quick Inference
-
-There are usually three ways to inference Real-ESRGAN.
-
-1. [Online inference](#online-inference)
-1. [Portable executable files (NCNN)](#portable-executable-files-ncnn)
-1. [Python script](#python-script)
-
-### Online inference
-
-1. You can try in our website: [ARC Demo](https://arc.tencent.com/en/ai-demos/imgRestore) (now only support RealESRGAN_x4plus_anime_6B)
-1. [Colab Demo](https://colab.research.google.com/drive/1k2Zod6kSHEvraybHl50Lys0LerhyTMCo?usp=sharing) for Real-ESRGAN **|** [Colab Demo](https://colab.research.google.com/drive/1yNl9ORUxxlL4N0keJa2SEPB61imPQd1B?usp=sharing) for Real-ESRGAN (**anime videos**).
-
-### Portable executable files (NCNN)
-
-You can download [Windows](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip) / [Linux](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip) / [MacOS](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-macos.zip) **executable files for Intel/AMD/Nvidia GPU**.
-
-This executable file is **portable** and includes all the binaries and models required. No CUDA or PyTorch environment is needed.<br>
-
-You can simply run the following command (the Windows example, more information is in the README.md of each executable files):
+Run the following block in your terminal to create the `models` directory and download the required weights:
 
 ```bash
-./realesrgan-ncnn-vulkan.exe -i input.jpg -o output.png -n model_name
+mkdir -p models
+wget -O models/RealESRGAN_x2plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth
+wget -O models/realesr-general-x4v3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
+
 ```
 
-We have provided five models:
+## 4. Installation & Setup
 
-1. realesrgan-x4plus  (default)
-2. realesrnet-x4plus
-3. realesrgan-x4plus-anime (optimized for anime images, small model size)
-4. realesr-animevideov3 (animation video)
+### Virtual Environment
 
-You can use the `-n` argument for other models, for example, `./realesrgan-ncnn-vulkan.exe -i input.jpg -o output.png -n realesrnet-x4plus`
-
-#### Usage of portable executable files
-
-1. Please refer to [Real-ESRGAN-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan#computer-usages) for more details.
-1. Note that it does not support all the functions (such as `outscale`) as the python script `inference_realesrgan.py`.
-
-```console
-Usage: realesrgan-ncnn-vulkan.exe -i infile -o outfile [options]...
-
-  -h                   show this help
-  -i input-path        input image path (jpg/png/webp) or directory
-  -o output-path       output image path (jpg/png/webp) or directory
-  -s scale             upscale ratio (can be 2, 3, 4. default=4)
-  -t tile-size         tile size (>=32/0=auto, default=0) can be 0,0,0 for multi-gpu
-  -m model-path        folder path to the pre-trained models. default=models
-  -n model-name        model name (default=realesr-animevideov3, can be realesr-animevideov3 | realesrgan-x4plus | realesrgan-x4plus-anime | realesrnet-x4plus)
-  -g gpu-id            gpu device to use (default=auto) can be 0,1,2 for multi-gpu
-  -j load:proc:save    thread count for load/proc/save (default=1:2:2) can be 1:2,2,2:2 for multi-gpu
-  -x                   enable tta mode"
-  -f format            output image format (jpg/png/webp, default=ext/png)
-  -v                   verbose output
-```
-
-Note that it may introduce block inconsistency (and also generate slightly different results from the PyTorch implementation), because this executable file first crops the input image into several tiles, and then processes them separately, finally stitches together.
-
-### Python script
-
-#### Usage of python script
-
-1. You can use X4 model for **arbitrary output size** with the argument `outscale`. The program will further perform cheap resize operation after the Real-ESRGAN output.
-
-```console
-Usage: python inference_realesrgan.py -n RealESRGAN_x4plus -i infile -o outfile [options]...
-
-A common command: python inference_realesrgan.py -n RealESRGAN_x4plus -i infile --outscale 3.5 --face_enhance
-
-  -h                   show this help
-  -i --input           Input image or folder. Default: inputs
-  -o --output          Output folder. Default: results
-  -n --model_name      Model name. Default: RealESRGAN_x4plus
-  -s, --outscale       The final upsampling scale of the image. Default: 4
-  --suffix             Suffix of the restored image. Default: out
-  -t, --tile           Tile size, 0 for no tile during testing. Default: 0
-  --face_enhance       Whether to use GFPGAN to enhance face. Default: False
-  --fp32               Use fp32 precision during inference. Default: fp16 (half precision).
-  --ext                Image extension. Options: auto | jpg | png, auto means using the same extension as inputs. Default: auto
-```
-
-#### Inference general images
-
-Download pre-trained models: [RealESRGAN_x4plus.pth](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth)
+This pipeline requires specific versioning to maintain compatibility with `BasicSR` and older GPU architectures like the GTX 1060.
 
 ```bash
-wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -P weights
+# Initialize environment
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+
+# Install dependencies with version constraints
+pip install "numpy<2.0"  # Critical for BasicSR compatibility
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu117
+pip install ffmpeg-python opencv-python
+
+# Build Real-ESRGAN components
+pip install -r requirements.txt
+python3 setup.py develop --user
+
+# Verify the environment
+python3 verify_env.py
+
 ```
 
-Inference!
+> **Note:** Always ensure the environment is active before running any scripts: `source venv/bin/activate`
+
+## 5. Experimental Workflow (Recommended)
+
+Before processing a full video, use these steps to determine the best scaling factor. **Ensure your virtual environment is active.**
+
+### Step 1: Prepare the Video (De-interlacing)
+
+Before extracting clips or upscaling, check if your source is interlaced and generate a progressive master.
 
 ```bash
-python inference_realesrgan.py -n RealESRGAN_x4plus -i inputs --face_enhance
+# Detects interlacing and creates a progressive .mp4 in outputs/ if needed
+./prepare_video.sh inputs/my_tape.avi
+
 ```
 
-Results are in the `results` folder
+### Step 2: Extract a Test Clip
 
-#### Inference anime images
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/xinntao/public-figures/master/Real-ESRGAN/cmp_realesrgan_anime_1.png">
-</p>
-
-Pre-trained models: [RealESRGAN_x4plus_anime_6B](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth)<br>
- More details and comparisons with [waifu2x](https://github.com/nihui/waifu2x-ncnn-vulkan) are in [**anime_model.md**](docs/anime_model.md)
+Use the **progressive master** created in Step 1, or original video if it is already progressive, to cut a 10-second test segment.
 
 ```bash
-# download model
-wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth -P weights
-# inference
-python inference_realesrgan.py -n RealESRGAN_x4plus_anime_6B -i inputs
+# Usage: ./extract_test_clip.py <progressive_input> <start_time>
+./extract_test_clip.py outputs/my_tape_progressive.mp4 00:10:45
+
 ```
 
-Results are in the `results` folder
+### Step 3: Generate Comparison Versions
+
+Process the test clip at both 2x and 4x scales.
+
+```bash
+./run_test_comparisons.py outputs/my_test_clip_progressive.mp4
+
+```
+
+### Step 4: 4-Way Comparison
+
+Create a 4K side-by-side grid of Original, 2x, and 4x versions.
+
+```bash
+./compare_test_results.py outputs/my_test_clip_progressive.mp4
+
+```
+
+**View in VLC**: Open the resulting grid in a loop for analysis:
+`vlc --loop outputs/comparison_my_test_clip_4K_grid.mkv`
+
+## 6. Usage Guide
+
+### Running the Full Enhancement Pipeline
+
+Once you've decided on a scale factor, process the entire progressive master. **Ensure your virtual environment is active.**
+
+```bash
+# 2x Upscale (Default)
+python3 vhs_upscale_pipeline.py "outputs/my_tape_progressive.mp4"
+
+# 4x Upscale with forced cleanup of previous attempts
+python3 vhs_upscale_pipeline.py "outputs/my_tape_progressive.mp4" --scale 4 --force
+
+```
+
+### Adding Chapters
+
+1. Create a text file (e.g., `toc.txt`) with timestamps and titles.
+2. Run the muxing pipeline:
+
+```bash
+./mux_pipeline.sh "outputs/your_video_FINAL.mkv" "toc.txt"
+
+```
+
+## 7. Directory Structure
+
+```text
+.
+├── rife-ncnn-vulkan/      # Symlink to RIFE binaries
+├── models/                # .pth model weights
+├── venv/                  # Python virtual environment (ignored by git)
+├── outputs/               # Enhanced video results
+├── realesrgan/            # Core Real-ESRGAN package
+├── vhs_upscale_pipeline.py # Main enhancement driver
+├── prepare_video.sh       # PRE-PROCESS: Deinterlaces if needed
+├── probe_video.py         # DIAGNOSTIC: Detects interlacing
+├── extract_test_clip.py   # EXPERIMENT: Cuts 10s segments
+├── run_test_comparisons.py # EXPERIMENT: Orchestrates 2x/4x test runs
+├── compare_test_results.py # EXPERIMENT: Generates 4-way comparison grid
+├── verify_env.py          # Environment version check
+├── convert_chapters.py    # Chapter formatting utility
+├── mux_pipeline.sh        # Chapter muxing script
+├── setup.py               # Real-ESRGAN build script
+├── requirements.txt       # Pipeline dependencies
+└── README_Original.md     # Original Real-ESRGAN documentation
+
+```
+
+---
+## Technical Note: De-interlacing Mode
+
+The `prepare_video.sh` script utilizes the **BWDIF (Bob Weaver Deinterlacing Filter)** in **Mode 0**. This weaves fields together into a progressive 29.97p frame without dropping temporal data, providing the cleanest possible "base" for the AI models to process.
 
 ---
 
-## BibTeX
+## Original Project Documentation
 
-    @InProceedings{wang2021realesrgan,
-        author    = {Xintao Wang and Liangbin Xie and Chao Dong and Ying Shan},
-        title     = {Real-ESRGAN: Training Real-World Blind Super-Resolution with Pure Synthetic Data},
-        booktitle = {International Conference on Computer Vision Workshops (ICCVW)},
-        date      = {2021}
-    }
-
-## 📧 Contact
-
-If you have any question, please email `xintao.wang@outlook.com` or `xintaowang@tencent.com`.
-
-<!---------------------------------- Projects that use Real-ESRGAN --------------------------->
-## 🧩 Projects that use Real-ESRGAN
-
-If you develop/use Real-ESRGAN in your projects, welcome to let me know.
-
-- NCNN-Android: [RealSR-NCNN-Android](https://github.com/tumuyan/RealSR-NCNN-Android) by [tumuyan](https://github.com/tumuyan)
-- VapourSynth: [vs-realesrgan](https://github.com/HolyWu/vs-realesrgan) by [HolyWu](https://github.com/HolyWu)
-- NCNN: [Real-ESRGAN-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan)
-
-&nbsp;&nbsp;&nbsp;&nbsp;**GUI**
-
-- [Waifu2x-Extension-GUI](https://github.com/AaronFeng753/Waifu2x-Extension-GUI) by [AaronFeng753](https://github.com/AaronFeng753)
-- [Squirrel-RIFE](https://github.com/Justin62628/Squirrel-RIFE) by [Justin62628](https://github.com/Justin62628)
-- [Real-GUI](https://github.com/scifx/Real-GUI) by [scifx](https://github.com/scifx)
-- [Real-ESRGAN_GUI](https://github.com/net2cn/Real-ESRGAN_GUI) by [net2cn](https://github.com/net2cn)
-- [Real-ESRGAN-EGUI](https://github.com/WGzeyu/Real-ESRGAN-EGUI) by [WGzeyu](https://github.com/WGzeyu)
-- [anime_upscaler](https://github.com/shangar21/anime_upscaler) by [shangar21](https://github.com/shangar21)
-- [Upscayl](https://github.com/upscayl/upscayl) by [Nayam Amarshe](https://github.com/NayamAmarshe) and [TGS963](https://github.com/TGS963)
-
-## 🤗 Acknowledgement
-
-Thanks for all the contributors.
-
-- [AK391](https://github.com/AK391): Integrate RealESRGAN to [Huggingface Spaces](https://huggingface.co/spaces) with [Gradio](https://github.com/gradio-app/gradio). See [Gradio Web Demo](https://huggingface.co/spaces/akhaliq/Real-ESRGAN).
-- [Asiimoviet](https://github.com/Asiimoviet): Translate the README.md to Chinese (中文).
-- [2ji3150](https://github.com/2ji3150): Thanks for the [detailed and valuable feedbacks/suggestions](https://github.com/xinntao/Real-ESRGAN/issues/131).
-- [Jared-02](https://github.com/Jared-02): Translate the Training.md to Chinese (中文).
+This project is a fork of Real-ESRGAN. For the original research, training details, and technical specifications, please refer to the **[README_Original.md](./README_Original.md)**.

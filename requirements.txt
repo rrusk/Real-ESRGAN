@@ -1,9 +1,15 @@
-basicsr>=1.4.2
+# Core Constraints for Stability
+numpy==1.25.0
+basicsr==1.4.2
 facexlib>=0.2.5
 gfpgan>=1.3.5
-numpy
-opencv-python
+
+# Media Processing
+opencv-python<4.10
+ffmpeg-python
 Pillow
-torch>=1.7
-torchvision
 tqdm
+
+# Deep Learning (Versioned for CUDA 11.7 compatibility)
+torch==2.0.1
+torchvision==0.15.2

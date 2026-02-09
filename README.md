@@ -115,7 +115,7 @@ Process the test clip at both 2x and 4x scales.
 Create a 4K side-by-side grid of Original, 2x, and 4x versions.
 
 ```bash
-./compare_test_results.py outputs/my_test_clip_progressive.mp4
+./compare_test_results.sh outputs/my_test_clip_progressive.mp4
 
 ```
 
@@ -161,7 +161,7 @@ python3 vhs_upscale_pipeline.py "outputs/my_tape_progressive.mp4" --scale 4 --fo
 ├── probe_video.py         # DIAGNOSTIC: Detects interlacing
 ├── extract_test_clip.py   # EXPERIMENT: Cuts 10s segments
 ├── run_test_comparisons.py # EXPERIMENT: Orchestrates 2x/4x test runs
-├── compare_test_results.py # EXPERIMENT: Generates 4-way comparison grid
+├── compare_test_results.sh # EXPERIMENT: Generates 4-way comparison grid
 ├── verify_env.py          # Environment version check
 ├── convert_chapters.py    # Chapter formatting utility
 ├── mux_pipeline.sh        # Chapter muxing script

@@ -189,6 +189,8 @@ def main(args):
     # --- 1. Set up variables based on args ---
     INPUT_VIDEO = args.input_video
     SCALE_FACTOR = args.scale
+    # Detect extension to support both .avi and .mp4
+    INPUT_EXT = os.path.splitext(INPUT_VIDEO)[1]
 
     if not os.path.exists(INPUT_VIDEO):
         print(f"Error: Input video not found at: {INPUT_VIDEO}")
@@ -204,6 +206,7 @@ def main(args):
     ORIGINAL_AUDIO_FILE = os.path.join(PROCESSING_DIR, f"{input_basename}_original.mp3")
 
     print(f"--- Starting processing for: {INPUT_VIDEO} ---")
+    print(f"Detected Input Extension: {INPUT_EXT}")
     print(f"Selected Scale Factor: {SCALE_FACTOR}x")
     print(f"Selected Model: {REALSRGAN_MODEL}")
     print(f"Final Output File: {FINAL_VIDEO_FILE}")
@@ -284,9 +287,10 @@ def main(args):
     else:
         print(f"Original audio already exists: {ORIGINAL_AUDIO_FILE}")
 
-    chunk_file_pattern = os.path.join(INPUT_CHUNKS_DIR, "chunk_%03d.avi")
-    if not os.path.exists(os.path.join(INPUT_CHUNKS_DIR, "chunk_000.avi")):
-        print("Splitting video into chunks (video only)...")
+    # Use dynamic extension for chunk file pattern
+    chunk_file_pattern = os.path.join(INPUT_CHUNKS_DIR, f"chunk_%03d{INPUT_EXT}")
+    if not os.path.exists(os.path.join(INPUT_CHUNKS_DIR, f"chunk_000{INPUT_EXT}")):
+        print(f"Splitting video into chunks (video only, extension {INPUT_EXT})...")
         cmd_split = [
             "ffmpeg", "-i", INPUT_VIDEO, 
             "-an", "-c:v", "copy", "-map", "0:v",
@@ -311,7 +315,8 @@ def main(args):
         chunk_start_time = time.time()
         print(f"\nProcessing Chunk {i+1} / {total_chunks} ({chunk_name})")
 
-        input_chunk = os.path.join(INPUT_CHUNKS_DIR, f"{chunk_name}.avi")
+        # Use dynamic extension for input chunks
+        input_chunk = os.path.join(INPUT_CHUNKS_DIR, f"{chunk_name}{INPUT_EXT}")
         esrgan_temp_work_dir = os.path.join(ESRGAN_CHUNKS_DIR, f"{chunk_name}_temp_work")
         esrgan_output_file = os.path.join(ESRGAN_CHUNKS_DIR, f"{chunk_name}_esrgan.mp4")
         

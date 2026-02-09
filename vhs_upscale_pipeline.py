@@ -28,6 +28,14 @@ CONCAT_FILE = os.path.join(PROCESSING_DIR, "concat_list.txt")
 TEST_MODE_CHUNKS = None
 
 # --- Helper Functions ---
+def check_venv():
+    """Ensures the script is running inside the virtual environment."""
+    # sys.prefix != sys.base_prefix is the standard way to detect a venv in Python 3
+    if not (sys.prefix != sys.base_prefix or 'VIRTUAL_ENV' in os.environ):
+        print("\n[!] ERROR: Virtual environment not detected.")
+        print("    This pipeline requires specific versions (e.g., numpy<2.0) found in venv.")
+        print("    Please run: source venv/bin/activate")
+
 def safe_rmtree(path):
     """Safely remove a directory tree."""
     if os.path.isdir(path):
@@ -185,6 +193,8 @@ Examples:
 
 def main(args):
     """Main processing pipeline."""
+    # --- 0. Pre-Flight Checks ---
+    check_venv()
     
     # --- 1. Set up variables based on args ---
     INPUT_VIDEO = args.input_video
@@ -344,8 +354,8 @@ def main(args):
                 "ffmpeg", "-y",
                 "-i", input_chunk,
                 "-vf", "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
-                "-c:v", "libx264", "-crf", "18", 
-                "-preset", "slow", # <-- FIX: Use 'slow' for better quality
+                "-c:v", "libx264", "-crf", "16", # <-- Quality Fix: CRF 16 for master fidelity
+                "-preset", "slower", # <-- Quality Fix: 'slower' for maximum detail
                 "-pix_fmt", "yuv420p",
                 prefiltered_chunk
             ]
@@ -441,7 +451,8 @@ def main(args):
             "-i", os.path.join(rife_out_frames_dir, "%08d.png"),
             "-c:v", "libx264", 
             "-pix_fmt", "yuv420p",
-            "-crf", "18",
+            "-crf", "17", # <-- Quality Fix: CRF 17 for high-bitrate 4K assembly
+            "-preset", "slower", # <-- Quality Fix: 'slower' for maximum fidelity
             rife_output_file
         ]
         try:

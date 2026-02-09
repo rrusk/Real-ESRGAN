@@ -25,6 +25,13 @@ Example:
 
 def probe_metadata(input_file):
     """Fetches resolution, framerate, bitrate, and pixel format using ffprobe."""
+    # Check if the user is trying to probe an ISO directly
+    if input_file.lower().endswith('.iso'):
+        raise ValueError(
+            "Cannot probe .ISO files directly. Please mount the ISO and "
+            "probe the individual VOB files (e.g., VTS_01_1.VOB)."
+        )
+
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -34,6 +41,10 @@ def probe_metadata(input_file):
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     data = json.loads(result.stdout)
+    
+    if 'streams' not in data or not data['streams']:
+        raise KeyError(f"No video streams found in {input_file}. Ensure it is a valid video file.")
+        
     return data['streams'][0]
 
 def detect_interlace(input_file, frames=500):

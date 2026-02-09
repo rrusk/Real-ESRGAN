@@ -6,6 +6,17 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+
+def check_venv():
+    """Ensures the script is running inside the virtual environment."""
+    # sys.prefix != sys.base_prefix is the standard way to detect a venv in Python 3
+    if not (sys.prefix != sys.base_prefix or 'VIRTUAL_ENV' in os.environ):
+        print("\n[!] ERROR: Virtual environment not detected.")
+        print("    This script requires the project venv to ensure consistent tool versions.")
+        print("    Please run: source venv/bin/activate")
+        sys.exit(1)
+
+
 def parse_args():
     # Use RawDescriptionHelpFormatter to preserve any custom formatting in the epilog
     parser = argparse.ArgumentParser(
@@ -33,6 +44,9 @@ Examples:
     return parser.parse_args()
 
 def main():
+    # --- 0. Pre-Flight Check ---
+    check_venv()
+
     args = parse_args()
     
     # Ensure the output directory exists

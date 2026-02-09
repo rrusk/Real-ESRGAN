@@ -139,12 +139,26 @@ python3 vhs_upscale_pipeline.py "outputs/my_tape_progressive.mp4" --scale 4 --fo
 
 ### Adding Chapters
 
-1. Create a text file (e.g., `toc.txt`) with timestamps and titles.
-2. Run the muxing pipeline:
+You can embed chapter markers into your final MKV file using a simple text file. This process is lossless and does not require re-encoding the video.
+
+1. **Create your chapter source file**: Create a text file (e.g., `toc.txt`) where each line contains a chapter title followed by a timestamp in `M:SS` or `MM:SS` format.
+*Example `toc.txt` content:*
+```text
+Introduction 0:00
+Opening Scene 2:15
+The Big Race 12:45
+Credits 1:04:30
+
+```
+
+
+2. **Run the chaptering script**: Use the `add_chapters.sh` utility located in the `utils/` directory.
+
+
 
 ```bash
-./mux_pipeline.sh "outputs/your_video_FINAL.mkv" "toc.txt"
-
+# Usage: ./utils/add_chapters.sh <input_video> <chapter_text_file>
+./utils/add_chapters.sh "outputs/your_video_FINAL.mkv" "toc.txt"
 ```
 
 ## 7. Directory Structure
@@ -156,6 +170,9 @@ python3 vhs_upscale_pipeline.py "outputs/my_tape_progressive.mp4" --scale 4 --fo
 ├── venv/                  # Python virtual environment (ignored by git)
 ├── outputs/               # Enhanced video results
 ├── realesrgan/            # Core Real-ESRGAN package
+├── utils/                 # Utility scripts
+│   ├── convert_chapters.py # Chapter formatting utility
+│   └── add_chapters.sh    # Chapter muxing script
 ├── vhs_upscale_pipeline.py # Main enhancement driver
 ├── prepare_video.sh       # PRE-PROCESS: Deinterlaces if needed
 ├── probe_video.py         # DIAGNOSTIC: Detects interlacing
@@ -163,8 +180,6 @@ python3 vhs_upscale_pipeline.py "outputs/my_tape_progressive.mp4" --scale 4 --fo
 ├── run_test_comparisons.py # EXPERIMENT: Orchestrates 2x/4x test runs
 ├── compare_test_results.sh # EXPERIMENT: Generates 4-way comparison grid
 ├── verify_env.py          # Environment version check
-├── convert_chapters.py    # Chapter formatting utility
-├── mux_pipeline.sh        # Chapter muxing script
 ├── setup.py               # Real-ESRGAN build script
 ├── requirements.txt       # Pipeline dependencies
 └── README_Original.md     # Original Real-ESRGAN documentation

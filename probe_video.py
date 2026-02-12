@@ -6,13 +6,16 @@ import json
 import argparse
 import os
 
+# ==============================================================================
+# CLI ARGUMENT PARSING
+# ==============================================================================
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Probe video for VHS enhancement metadata, interlacing, and quality metrics.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example:
-  ./probe_video.py inputs/my_tape.avi
+  ./probe_video.py inputs/vhs_capture.avi
         """
     )
     parser.add_argument("input", help="Path to the video file to analyze.")
@@ -23,13 +26,16 @@ Example:
         
     return parser.parse_args()
 
+# ==============================================================================
+# METADATA EXTRACTION (ffprobe)
+# ==============================================================================
 def probe_metadata(input_file):
     """Fetches resolution, framerate, bitrate, and pixel format using ffprobe."""
     # Check if the user is trying to probe an ISO directly
     if input_file.lower().endswith('.iso'):
         raise ValueError(
-            "Cannot probe .ISO files directly. Please mount the ISO and "
-            "probe the individual VOB files (e.g., VTS_01_1.VOB)."
+            "Cannot probe .ISO files directly. Mount the ISO and "
+            "probe individual VOB files (e.g., VTS_01_1.VOB)."
         )
 
     cmd = [
@@ -43,13 +49,16 @@ def probe_metadata(input_file):
     data = json.loads(result.stdout)
     
     if 'streams' not in data or not data['streams']:
-        raise KeyError(f"No video streams found in {input_file}. Ensure it is a valid video file.")
+        raise KeyError(f"No video streams found in {input_file}.")
         
     return data['streams'][0]
 
+# ==============================================================================
+# INTERLACING DETECTION (idet)
+# ==============================================================================
 def detect_interlace(input_file, frames=500):
-    """Analyzes first X frames for interlacing artifacts using idet filter."""
-    print(f"Analyzing first {frames} frames for interlacing...")
+    """Analyzes frames for interlacing artifacts (TFF/BFF)."""
+    print(f"Analyzing first {frames} frames for interlacing (may be slow on upscaled files)...")
     cmd = [
         "ffmpeg", "-i", input_file,
         "-filter:v", "idet",
@@ -73,34 +82,60 @@ def detect_interlace(input_file, frames=500):
             return f"Interlaced (BFF detected: {bff}/{total})"
     return "Undetermined"
 
+# ==============================================================================
+# UNIVERSAL DATA HEALTH (Bits Per Pixel Logic)
+# ==============================================================================
 def check_bitrate_health(meta, input_file):
-    """Determines if the file has enough data density for quality AI upscaling."""
+    """Universal health check based on Bits Per Pixel (bpp)."""
     try:
-        bitrate_bps = int(meta.get('bit_rate', 0))
+        file_size_bits = os.path.getsize(input_file) * 8
         
-        # FALLBACK: If bitrate is 0 (common in MTS), calculate from size/duration
-        if bitrate_bps == 0:
-            file_size_bits = os.path.getsize(input_file) * 8
-            duration = float(meta.get('duration', 0))
-            if duration > 0:
-                bitrate_bps = file_size_bits / duration
-            else:
-                return "Unknown (Missing Metadata and Duration)"
-
-        bitrate_mbps = bitrate_bps / 1_000_000
+        # 1. Resolve Duration (Handles Hauppauge header/DTS issues)
+        duration = float(meta.get('duration', 0))
+        if duration > 86400 or duration <= 0:
+            # Fallback: Count actual packets for broken timestamps
+            cmd = ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", 
+                   "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", input_file]
+            frames = int(subprocess.check_output(cmd).decode().strip())
+            fps_num, fps_den = map(int, meta.get('r_frame_rate', '30000/1001').split('/'))
+            duration = frames / (fps_num / fps_den)
         
-        # Updated Heuristics for HD/MTS content
-        if bitrate_mbps > 15:
-            return f"Excellent ({bitrate_mbps:.2f} Mbps) - High Detail Retention"
-        elif bitrate_mbps > 5:
-            return f"Good ({bitrate_mbps:.2f} Mbps) - Standard Digital Capture"
-        elif bitrate_mbps > 1:
-            return f"Fair ({bitrate_mbps:.2f} Mbps) - Compressed (Expect AI Artifacting)"
+        # 2. Calculate Density Metrics
+        bitrate_mbps = (file_size_bits / duration) / 1_000_000
+        width, height = int(meta.get('width', 0)), int(meta.get('height', 0))
+        fps_num, fps_den = map(int, meta.get('r_frame_rate', '30000/1001').split('/'))
+        fps = fps_num / fps_den
+        
+        # bpp = Total bits available for every pixel in the video
+        bpp = file_size_bits / (width * height * (fps * duration))
+        
+        # 3. Dynamic Thresholds (Codec-Aware)
+        pix_fmt = meta.get('pix_fmt', '')
+        
+        # If the format is uncompressed (like yuyv422), we expect bpp to be near 16
+        if 'yuyv' in pix_fmt or 'raw' in pix_fmt:
+            target = 16.0  # Uncompressed 4:2:2 baseline
         else:
+            target = 0.15  # High-quality H.264 baseline
+            
+        ratio = bpp / target
+
+        # 4. Universal Labels
+        if ratio >= 0.9: 
+            return f"Excellent ({bitrate_mbps:.2f} Mbps) - High Detail Retention"
+        elif ratio >= 0.6: 
+            return f"Good ({bitrate_mbps:.2f} Mbps) - Standard Quality"
+        elif ratio >= 0.3: 
+            return f"Fair ({bitrate_mbps:.2f} Mbps) - Compressed"
+        else: 
             return f"Poor ({bitrate_mbps:.2f} Mbps) - Heavily Compressed"
+
     except Exception as e:
         return f"Unknown Error: {e}"
-        
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
 def main():
     args = parse_args()
     
@@ -118,9 +153,9 @@ def main():
         print(f"Data Health: {quality_health}")
         print("--------------------------\n")
 
-        # Specific VHS Recommendations
+        # Visual Scannability: High-level Warnings
         if "Poor" in quality_health or "Fair" in quality_health:
-            print("⚠️  DATA WARNING: Low bitrate detected. AI upscaling (especially 4x)")
+            print("⚠️  DATA WARNING: Low bitrate detected. AI upscaling")
             print("   may amplify compression blocks instead of actual detail.")
         
         if "Interlaced" in interlace_status:

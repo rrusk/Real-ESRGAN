@@ -27,7 +27,20 @@ RIFE_CHUNKS_DIR = os.path.join(PROCESSING_DIR, "2_rife_chunks")
 CONCAT_FILE = os.path.join(PROCESSING_DIR, "concat_list.txt")
 TEST_MODE_CHUNKS = None
 
+
 # --- Helper Functions ---
+class Timer:
+    """Context manager for simple execution timing."""
+    def __init__(self, name):
+        self.name = name
+    def __enter__(self):
+        self.start = time.time()
+        return self
+    def __exit__(self, *args):
+        self.end = time.time()
+        duration = self.end - self.start
+        print(f"   [Perf] {self.name} took {duration:.2f} seconds.")
+
 def check_venv():
     """Ensures the script is running inside the virtual environment."""
     # sys.prefix != sys.base_prefix is the standard way to detect a venv in Python 3
@@ -189,6 +202,11 @@ Examples:
         action="store_true", 
         help="Force deletion of old processing chunks without prompting."
     )
+    parser.add_argument(
+        "--halo-aware", 
+        action="store_true", 
+        help="Adjust pre-filters to reduce enhancement of existing halo/ringing artifacts."
+    )
     return parser.parse_args()
 
 def main(args):
@@ -201,6 +219,15 @@ def main(args):
     SCALE_FACTOR = args.scale
     # Detect extension to support both .avi and .mp4
     INPUT_EXT = os.path.splitext(INPUT_VIDEO)[1]
+    
+    # Set default VHS pre-filter values
+    # Original: hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6
+    if args.halo_aware:
+        # Reduced sharpening and slightly increased denoise to soften halos
+        prefilter_vf = "hqdn3d=4:4:8:8,pp=ac,unsharp=3:3:0.2"
+        print("   [Mode] Halo-Aware filtering enabled (Softened sharpening).")
+    else:
+        prefilter_vf = "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6"
 
     if not os.path.exists(INPUT_VIDEO):
         print(f"Error: Input video not found at: {INPUT_VIDEO}")
@@ -281,7 +308,7 @@ def main(args):
         print(f"Extracting original audio to {ORIGINAL_AUDIO_FILE}...")
         cmd_audio = [
             "ffmpeg", "-y", "-i", INPUT_VIDEO,
-            "-vn", "-acodec", "copy",
+            "-vn", "-acodec", "libmp3lame", "-q:a", "2", # Change 'copy' to 'libmp3lame'
             ORIGINAL_AUDIO_FILE
         ]
         try:
@@ -353,14 +380,15 @@ def main(args):
             cmd_prefilter = [
                 "ffmpeg", "-y",
                 "-i", input_chunk,
-                "-vf", "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
+                "-vf", prefilter_vf, # "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
                 "-c:v", "libx264", "-crf", "16", # <-- Quality Fix: CRF 16 for master fidelity
                 "-preset", "slower", # <-- Quality Fix: 'slower' for maximum detail
                 "-pix_fmt", "yuv420p",
                 prefiltered_chunk
             ]
             try:
-                subprocess.run(cmd_prefilter, check=True, capture_output=True, text=True)
+                with Timer(f"{chunk_name} Pre-filter"):
+                    subprocess.run(cmd_prefilter, check=True, capture_output=True, text=True)
             except subprocess.CalledProcessError as e:
                 print(f"\n--- ERROR: FFmpeg pre-filtering failed on {chunk_name} ---")
                 print("STDOUT:", e.stdout)
@@ -376,7 +404,8 @@ def main(args):
                 "--fps", source_fps_str,
             ]
             try:
-                subprocess.run(cmd_realesrgan, check=True, capture_output=True, text=True)
+                with Timer(f"{chunk_name} ESRGAN Inference"):
+                    subprocess.run(cmd_realesrgan, check=True, capture_output=True, text=True)
             except subprocess.CalledProcessError as e:
                 print(f"\n--- ERROR: Real-ESRGAN failed on {chunk_name} ---")
                 print("STDOUT:", e.stdout)
@@ -409,7 +438,8 @@ def main(args):
             os.path.join(rife_in_frames_dir, "frame_%08d.png")
         ]
         try:
-            subprocess.run(cmd_extract, check=True, capture_output=True, text=True)
+            with Timer(f"{chunk_name} RIFE Frame Extraction"):
+                subprocess.run(cmd_extract, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
             print(f"\n--- ERROR: FFmpeg frame extraction failed on {chunk_name} ---")
             print("STDOUT:", e.stdout)
@@ -425,7 +455,8 @@ def main(args):
             "-s", "0.5"
         ]
         try:
-            subprocess.run(cmd_rife, check=True, capture_output=True, text=True)
+            with Timer(f"{chunk_name} RIFE Interpolation"):
+                subprocess.run(cmd_rife, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
             print(f"\n--- ERROR: RIFE failed on {chunk_name} ---")
             print("STDOUT:", e.stdout)
@@ -456,7 +487,8 @@ def main(args):
             rife_output_file
         ]
         try:
-            subprocess.run(cmd_encode, check=True, capture_output=True, text=True)
+            with Timer(f"{chunk_name} RIFE Frame Encoding"):
+                subprocess.run(cmd_encode, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
             print(f"\n--- ERROR: FFmpeg frame encoding failed on {chunk_name} ---")
             print("STDOUT:", e.stdout)

@@ -153,3 +153,7 @@ processing_chunks/
 
 # Output videos
 outputs/
+*.avi
+*.mpg
+*.mp4
+*.mp3

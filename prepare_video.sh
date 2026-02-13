@@ -18,13 +18,14 @@ fi
 
 # 1. Argument Check
 if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
-    echo "Usage: $0 <source_video> [mask_pixels] [--test]"
+    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac]"
     echo ""
     echo "Arguments:"
     echo "  source_video    Path to the raw AVI, MPG, or MP4 file."
     echo "  mask_pixels     (Optional) Number of pixels to black out at the bottom (Default: 0)."
     echo "                  Use this to hide VHS head-switching noise."
     echo "  --test          (Optional) Process only the first 30s for quick mask review."
+    echo "  --aac           (Optional) Force AAC audio encoding even for compressed sources."
 
     echo ""
     echo "How to select mask_pixels:"
@@ -35,7 +36,7 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     exit 0
 fi
 
-if [ "$#" -gt 3 ]; then
+if [ "$#" -gt 4 ]; then
     echo "Error: Too many arguments."
     echo "Usage: $0 <source_video> [mask_pixels]"
     exit 1
@@ -44,13 +45,16 @@ fi
 SOURCE_INPUT="$1"
 MASK_PIXELS=0
 TEST_MODE=false
+FORCE_AAC=false
 
-# Simple parsing to handle optional numeric mask and --test flag
+# Simple parsing to handle optional numeric mask, --test, and --aac flags
 for arg in "$@"; do
     if [[ "$arg" =~ ^[0-9]+$ ]]; then
         MASK_PIXELS="$arg"
     elif [[ "$arg" == "--test" ]]; then
         TEST_MODE=true
+    elif [[ "$arg" == "--aac" ]]; then
+        FORCE_AAC=true
     fi
 done
 
@@ -102,6 +106,21 @@ if echo "$PROBE_LOG" | grep -q "unrealistic"; then
     FFLAGS="-fflags +genpts"
 fi
 
+# --- NEW: Audio Strategy Detection ---
+# Corrected ffprobe writer syntax to prevent 'nocov' error
+AUDIO_FORMAT=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$SOURCE_INPUT")
+
+if [[ "$FORCE_AAC" == true ]]; then
+    AUDIO_CMD="-c:a aac -b:a 192k"
+    echo "Override: Forcing AAC encoding."
+elif [[ "$AUDIO_FORMAT" == pcm* ]]; then
+    AUDIO_CMD="-c:a aac -b:a 192k"
+    echo "Detected PCM audio: Encoding to AAC for MP4 compatibility."
+else
+    AUDIO_CMD="-c:a copy"
+    echo "Detected $AUDIO_FORMAT audio: Using bitstream copy to preserve sync."
+fi
+
 # Determine Parity based on Probe results
 PARITY="-1" # Default Auto
 if echo "$SCAN_TYPE" | grep -q "TFF"; then PARITY="0"; fi
@@ -121,14 +140,13 @@ if echo "$PROBE_LOG" | grep -q "Interlaced"; then
     
     # Using bwdif mode 0 to convert 29.97i to 29.97p
     # -crf 16 and -preset slower for maximum data retention
-    # format=yuv420p ensures compatibility for the AI models
-    # -fflags +genpts added dynamically to fix broken durations
-    # -c:a aac used because MP4 does not support uncompressed PCM
+    # -field_order progressive ensures probe_video.py doesn't detect ghosts
     ffmpeg -y $FFLAGS -i "$SOURCE_INPUT" $LIMIT_CMD \
         -vf "$FILTER_CHAIN" \
         -c:v libx264 -crf 16 -preset slower \
+        -field_order progressive \
         -movflags +faststart \
-        -c:a aac -b:a 192k \
+        $AUDIO_CMD \
         "$PROG_OUTPUT"
     
     echo -e "\n✅ Success! Deinterlaced Master Created: $PROG_OUTPUT"

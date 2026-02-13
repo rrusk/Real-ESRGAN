@@ -28,7 +28,7 @@ fi
 
 AUDIO_DEV="hw:${AUDIO_CARD},0"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_FILE="vhs_capture_${TIMESTAMP}.avi"
+OUTPUT_FILE="vhs_capture_${TIMESTAMP}.mkv"
 
 echo "--------------------------------------------------------"
 echo "HAUPPAUGE CAPTURE SYSTEM"
@@ -47,16 +47,18 @@ v4l2-ctl -d "$VIDEO_DEV" -s ntsc >/dev/null 2>&1 # Force NTSC
 # --- 5. Action: Starting Combined Capture & Monitor ---
 # Using rawvideo for master archive and NUT pipe for live monitoring
 # Removed -nodb and -alwaysontop to avoid the ESM parsing errors
-echo "ACTION: Starting Raw Capture for $DUR_VAL..."
+echo "ACTION: Starting Lossless FFV1 Capture for $DUR_VAL..."
 echo "FILE:   $OUTPUT_FILE"
 echo "EXIT:   Press 'q' in the monitor window to stop"
 echo "--------------------------------------------------------"
 
+# Using FFV1 version 3 for archival stability
 ffmpeg -hide_banner -loglevel error \
        -f v4l2 -thread_queue_size 2048 -video_size 720x480 -i "$VIDEO_DEV" \
        -f alsa -thread_queue_size 2048 -i "$AUDIO_DEV" \
        -t "$DUR_VAL" \
-       -c:v rawvideo -pix_fmt yuyv422 -c:a pcm_s16le \
+       -c:v ffv1 -level 3 -coder 1 -context 1 -pix_fmt yuyv422 \
+       -c:a pcm_s16le \
        -f tee -map 0:v -map 1:a \
        "$OUTPUT_FILE|[f=nut]pipe:1" | ffplay -i - -window_title "RECORDING MONITOR" -autoexit
 

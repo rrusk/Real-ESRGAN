@@ -57,30 +57,97 @@ def probe_metadata(input_file):
 # INTERLACING DETECTION (idet)
 # ==============================================================================
 def detect_interlace(input_file, frames=500):
-    """Analyzes frames for interlacing artifacts (TFF/BFF)."""
-    print(f"Analyzing first {frames} frames for interlacing (may be slow on upscaled files)...")
+    """
+    Production-grade interlace detection.
+
+    Detection order:
+    1. Check codec-level frame flags (authoritative).
+    2. If structurally progressive -> return Progressive.
+    3. Otherwise run idet and require meaningful dominance.
+    """
+
+    # ------------------------------------------------------------
+    # STEP 1 — Structural Frame Check (Authoritative)
+    # ------------------------------------------------------------
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_frames",
+            "-read_intervals", "%+#50",  # check first 50 frames only
+            input_file
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        interlaced_flags = re.findall(r"interlaced_frame=(\d)", result.stdout)
+
+        if interlaced_flags:
+            interlaced_count = sum(int(x) for x in interlaced_flags)
+            total_checked = len(interlaced_flags)
+
+            # If ANY frames are structurally interlaced, trust this fully
+            if interlaced_count > 0:
+                return "Interlaced (Frame-flag detected)"
+            else:
+                # Structurally progressive — no need for idet
+                return "Progressive"
+
+    except Exception:
+        pass  # Fall through to idet if something unexpected happens
+
+    # ------------------------------------------------------------
+    # STEP 2 — Pixel-Level Heuristic Check (idet fallback)
+    # ------------------------------------------------------------
+    print(f"Analyzing first {frames} frames for interlacing (idet heuristic)...")
+
     cmd = [
-        "ffmpeg", "-i", input_file,
+        "ffmpeg",
+        "-i", input_file,
         "-filter:v", "idet",
         "-frames:v", str(frames),
-        "-an", "-f", "null", "-"
+        "-an",
+        "-f", "null",
+        "-"
     ]
+
     result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    match = re.search(r"Multi frame detection: TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)", result.stderr)
-    
-    if match:
-        tff, bff, prog = map(int, match.groups())
-        total = tff + bff + prog
-        if total == 0: return "Unknown"
-        
-        if prog / total > 0.90:
-            return "Progressive"
-        elif tff > bff:
-            return f"Interlaced (TFF detected: {tff}/{total})"
+
+    match = re.search(
+        r"Multi frame detection: TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)",
+        result.stderr
+    )
+
+    if not match:
+        return "Undetermined"
+
+    tff, bff, prog = map(int, match.groups())
+    total = tff + bff + prog
+
+    if total == 0:
+        return "Undetermined"
+
+    interlace_ratio = (tff + bff) / total
+    progressive_ratio = prog / total
+
+    # ------------------------------------------------------------
+    # PROFESSIONAL THRESHOLDS
+    # ------------------------------------------------------------
+    # <15% interlace noise = treat as progressive
+    # >20% dominance = true interlace
+    # between 15–20% = weak/ambiguous
+    # ------------------------------------------------------------
+
+    if interlace_ratio < 0.15:
+        return f"Progressive (idet noise {interlace_ratio:.1%})"
+
+    if interlace_ratio > 0.20:
+        if tff > bff:
+            return f"Interlaced (TFF {tff}/{total})"
         else:
-            return f"Interlaced (BFF detected: {bff}/{total})"
-    return "Undetermined"
+            return f"Interlaced (BFF {bff}/{total})"
+
+    return f"Mostly Progressive (weak field artifacts {interlace_ratio:.1%})"
 
 # ==============================================================================
 # UNIVERSAL DATA HEALTH (Bits Per Pixel Logic)

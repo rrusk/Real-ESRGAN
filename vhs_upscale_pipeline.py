@@ -207,6 +207,13 @@ Examples:
         action="store_true", 
         help="Adjust pre-filters to reduce enhancement of existing halo/ringing artifacts."
     )
+    parser.add_argument(
+        "--max-runtime",
+        type=float,
+        default=None,
+        metavar="HOURS",
+        help="Maximum runtime in hours before graceful shutdown. Script will not start a new chunk if (elapsed time + last chunk duration) would exceed this limit. Example: --max-runtime 8"
+    )
     return parser.parse_args()
 
 def main(args):
@@ -503,6 +510,31 @@ def main(args):
         chunk_end_time = time.time()
         duration_sec = chunk_end_time - chunk_start_time
         print(f"  > Chunk finished in {duration_sec:.2f} seconds.")
+        
+        # --- Runtime Limit Check ---
+        if args.max_runtime is not None:
+            elapsed_hours = (chunk_end_time - total_start_time) / 3600
+            chunk_hours = duration_sec / 3600
+            max_runtime_hours = args.max_runtime
+            
+            # Check if we should continue to the next chunk
+            if i + 1 < chunks_to_process:  # Only check if there are more chunks
+                projected_hours = elapsed_hours + chunk_hours
+                
+                print(f"\n  [Runtime Check]")
+                print(f"    Elapsed: {elapsed_hours:.2f}h / {max_runtime_hours:.2f}h")
+                print(f"    Last chunk: {chunk_hours:.2f}h")
+                print(f"    Projected next completion: {projected_hours:.2f}h")
+                
+                if projected_hours > max_runtime_hours:
+                    print(f"\n  ⏸️  GRACEFUL SHUTDOWN: Would exceed {max_runtime_hours}h runtime limit.")
+                    print(f"    Processed {i+1}/{total_chunks} chunks successfully.")
+                    print(f"    Resume anytime - script will continue from chunk {i+1}.")
+                    # Exit the chunk loop cleanly
+                    break
+                else:
+                    remaining = max_runtime_hours - elapsed_hours
+                    print(f"    Continuing (est. {remaining:.2f}h remaining)")
 
     # --- Step 3: Concatenate All Processed Chunks ---
     print("\n--- 3: Concatenating Chunks & Muxing Audio ---")
@@ -518,6 +550,13 @@ def main(args):
     final_chunk_files = glob.glob(os.path.join(RIFE_CHUNKS_DIR, "*_rife.mp4"))
     total_processed_chunks = len(final_chunk_files)
     print(f"Found {total_processed_chunks} processed chunks to concatenate.")
+    
+    # Check if all chunks are complete before attempting final concatenation
+    if total_processed_chunks < total_chunks:
+        print(f"\n⚠️  Incomplete processing: {total_processed_chunks}/{total_chunks} chunks complete.")
+        print(f"   Run the script again to resume from chunk {total_processed_chunks}.")
+        print(f"   Final video will be created once all {total_chunks} chunks are processed.")
+        sys.exit(0)
 
     with open(CONCAT_FILE, "w") as f:
         for i in range(total_processed_chunks):

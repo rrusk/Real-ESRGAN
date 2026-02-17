@@ -199,6 +199,12 @@ Examples:
         help="Upscale factor: 2 (for RealESRGAN_x2plus) or 4 (for realesr-general-x4v3). Default: 2"
     )
     parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="Number of FFmpeg threads (default: half of logical CPU cores, minimum 4)"
+    )
+    parser.add_argument(
         "-f", "--force", 
         action="store_true", 
         help="Force deletion of old processing chunks without prompting."
@@ -236,6 +242,14 @@ def main(args):
         print("   [Mode] Halo-Aware filtering enabled (Softened sharpening).")
     else:
         prefilter_vf = "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6"
+
+    # Calculate FFmpeg thread count
+    if args.threads and args.threads > 0:
+        threads = args.threads
+    else:
+        cpu_count = os.cpu_count() or 4
+        threads = max(4, cpu_count // 2)
+    print(f"[INFO] Using {threads} FFmpeg threads")
 
     if not os.path.exists(INPUT_VIDEO):
         print(f"Error: Input video not found at: {INPUT_VIDEO}")
@@ -389,7 +403,7 @@ def main(args):
                 "ffmpeg", "-y",
                 "-i", input_chunk,
                 "-vf", prefilter_vf, # "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
-                "-c:v", "libx264", "-threads", "8", "-crf", "16", # <-- Quality Fix: CRF 16 for master fidelity
+                "-c:v", "libx264", "-threads", str(threads), "-crf", "16", # <-- Quality Fix: CRF 16 for master fidelity
                 "-preset", "slower", # <-- Quality Fix: 'slower' for maximum detail
                 "-pix_fmt", "yuv420p",
                 prefiltered_chunk
@@ -489,7 +503,7 @@ def main(args):
             "-framerate", str(output_fps_float),
             "-i", os.path.join(rife_out_frames_dir, "%08d.png"),
             "-c:v", "libx264",
-            "-threads", "8",
+            "-threads", str(threads),
             "-pix_fmt", "yuv420p",
             "-crf", "17", # <-- Quality Fix: CRF 17 for high-bitrate 4K assembly
             "-preset", "slower", # <-- Quality Fix: 'slower' for maximum fidelity

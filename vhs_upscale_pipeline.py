@@ -48,6 +48,7 @@ def check_venv():
         print("\n[!] ERROR: Virtual environment not detected.")
         print("    This pipeline requires specific versions (e.g., numpy<2.0) found in venv.")
         print("    Please run: source venv/bin/activate")
+        sys.exit(1)
 
 def safe_rmtree(path):
     """Safely remove a directory tree."""
@@ -388,7 +389,7 @@ def main(args):
                 "ffmpeg", "-y",
                 "-i", input_chunk,
                 "-vf", prefilter_vf, # "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
-                "-c:v", "libx264", "-crf", "16", # <-- Quality Fix: CRF 16 for master fidelity
+                "-c:v", "libx264", "-threads", "8", "-crf", "16", # <-- Quality Fix: CRF 16 for master fidelity
                 "-preset", "slower", # <-- Quality Fix: 'slower' for maximum detail
                 "-pix_fmt", "yuv420p",
                 prefiltered_chunk
@@ -487,7 +488,8 @@ def main(args):
             "ffmpeg",
             "-framerate", str(output_fps_float),
             "-i", os.path.join(rife_out_frames_dir, "%08d.png"),
-            "-c:v", "libx264", 
+            "-c:v", "libx264",
+            "-threads", "8",
             "-pix_fmt", "yuv420p",
             "-crf", "17", # <-- Quality Fix: CRF 17 for high-bitrate 4K assembly
             "-preset", "slower", # <-- Quality Fix: 'slower' for maximum fidelity

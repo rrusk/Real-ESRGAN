@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# video_upscale_pipeline.py - Upscale and interpolate legacy video (VHS, Hi8, DV camcorder, etc.)
+# Uses Real-ESRGAN for upscaling and RIFE for frame interpolation.
 import subprocess
 import os
 import shutil
@@ -8,6 +10,8 @@ import glob
 import time
 import sys
 import argparse
+from datetime import datetime, timedelta
+import statistics
 
 # --- Config ---
 OUTPUT_DIR = "outputs"
@@ -54,6 +58,25 @@ def safe_rmtree(path):
     """Safely remove a directory tree."""
     if os.path.isdir(path):
         shutil.rmtree(path)
+
+# --- Logging Helper ---
+LOG_FILE = os.path.join(PROCESSING_DIR, "pipeline.log")
+
+class TeeLogger:
+    """
+    Duplicate stdout to console + logfile.
+    Resume-safe (append mode).
+    """
+    def __init__(self, logfile):
+        self.terminal = sys.stdout
+        os.makedirs(os.path.dirname(logfile), exist_ok=True)
+        self.log = open(logfile, "a", buffering=1)
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 def get_video_duration(video_file):
     cmd = [
@@ -181,12 +204,13 @@ def autotune_chunk_size(input_video_path, scale_factor):
 def parse_arguments():
     """Parses command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Upscale and interpolate VHS video files.",
+        description="Upscale and interpolate legacy video files (VHS, Hi8, DV camcorder, etc.).",
         epilog="""
 Examples:
   %(prog)s video.avi             # 2x upscaling (default)
   %(prog)s video.avi --scale 4   # 4x upscaling
   %(prog)s video.avi -s 4 --force # 4x upscaling, no cleanup prompt
+  %(prog)s camcorder.mp4         # works with DV, Hi8, and other camcorder formats
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -212,7 +236,7 @@ Examples:
     parser.add_argument(
         "--halo-aware", 
         action="store_true", 
-        help="Adjust pre-filters to reduce enhancement of existing halo/ringing artifacts."
+        help="Adjust pre-filters to reduce enhancement of existing halo/ringing artifacts (useful for VHS and analog camcorder sources)."
     )
     parser.add_argument(
         "--max-runtime",
@@ -227,6 +251,10 @@ def main(args):
     """Main processing pipeline."""
     # --- 0. Pre-Flight Checks ---
     check_venv()
+
+    # Enable tee logging from the very start (captures all startup messages)
+    sys.stdout = TeeLogger(LOG_FILE)
+    print(f"\n--- Pipeline started {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')} | Logging to {LOG_FILE} ---\n")
     
     # --- 1. Set up variables based on args ---
     INPUT_VIDEO = args.input_video
@@ -234,12 +262,12 @@ def main(args):
     # Detect extension to support both .avi and .mp4
     INPUT_EXT = os.path.splitext(INPUT_VIDEO)[1]
     
-    # Set default VHS pre-filter values
+    # Set default pre-filter values (tuned for analog/legacy video sources)
     # Original: hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6
     if args.halo_aware:
         # Reduced sharpening and slightly increased denoise to soften halos
         prefilter_vf = "hqdn3d=4:4:8:8,pp=ac,unsharp=3:3:0.2"
-        print("   [Mode] Halo-Aware filtering enabled (Softened sharpening).")
+        print("   [Mode] Halo-Aware filtering enabled (softened sharpening, recommended for VHS/Hi8 with existing ringing artifacts).")
     else:
         prefilter_vf = "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6"
 
@@ -328,19 +356,39 @@ def main(args):
 
     if not os.path.exists(ORIGINAL_AUDIO_FILE) or os.path.getsize(ORIGINAL_AUDIO_FILE) == 0:
         print(f"Extracting original audio to {ORIGINAL_AUDIO_FILE}...")
-        cmd_audio = [
-            "ffmpeg", "-y", "-i", INPUT_VIDEO,
-            "-vn", "-acodec", "libmp3lame", "-q:a", "2", # Change 'copy' to 'libmp3lame'
-            ORIGINAL_AUDIO_FILE
-        ]
+        # Attempt lossless passthrough first (preserves original codec, instant)
+        audio_copy_ok = False
         try:
-            subprocess.run(cmd_audio, check=True, capture_output=True, text=True)
+            cmd_audio_copy = [
+                "ffmpeg", "-y", "-i", INPUT_VIDEO,
+                "-vn", "-c:a", "copy",
+                ORIGINAL_AUDIO_FILE
+            ]
+            subprocess.run(cmd_audio_copy, check=True, capture_output=True, text=True)
+            if os.path.exists(ORIGINAL_AUDIO_FILE) and os.path.getsize(ORIGINAL_AUDIO_FILE) > 0:
+                audio_copy_ok = True
+                print(f"  > Audio extracted via stream copy (lossless).")
+            else:
+                print(f"  > Audio copy produced empty file, falling back to MP3 encode...")
         except subprocess.CalledProcessError as e:
-            print(f"\n--- ERROR: FFmpeg audio extraction failed ---")
-            print("STDOUT:", e.stdout)
-            print("STDERR:", e.stderr)
-            raise
-        
+            print(f"  > Audio copy failed (codec not compatible with output container), falling back to MP3 encode...")
+
+        if not audio_copy_ok:
+            # Fallback: re-encode to MP3 (handles any input codec)
+            try:
+                cmd_audio_mp3 = [
+                    "ffmpeg", "-y", "-i", INPUT_VIDEO,
+                    "-vn", "-acodec", "libmp3lame", "-q:a", "0",  # q:a 0 = highest VBR quality (~245kbps), handles Hi8/DV fidelity
+                    ORIGINAL_AUDIO_FILE
+                ]
+                subprocess.run(cmd_audio_mp3, check=True, capture_output=True, text=True)
+                print(f"  > Audio extracted via MP3 encode fallback (q:a 0, ~245kbps VBR).")
+            except subprocess.CalledProcessError as e:
+                print(f"\n--- ERROR: FFmpeg audio extraction failed (both copy and MP3 encode) ---")
+                print("STDOUT:", e.stdout)
+                print("STDERR:", e.stderr)
+                raise
+
         if not os.path.exists(ORIGINAL_AUDIO_FILE) or os.path.getsize(ORIGINAL_AUDIO_FILE) == 0:
             raise RuntimeError(f"Audio extraction failed to produce a valid file: {ORIGINAL_AUDIO_FILE}")
     else:
@@ -365,6 +413,7 @@ def main(args):
     print("\n--- 1. & 2. Processing All Chunks ---")
     total_start_time = time.time()
     chunks_to_process = total_chunks
+    chunk_durations = []  # Rolling history for median ETA
     if TEST_MODE_CHUNKS is not None:
         chunks_to_process = min(total_chunks, TEST_MODE_CHUNKS)
         print(f"*** TEST MODE: Only processing {chunks_to_process} chunk(s) ***")
@@ -372,7 +421,11 @@ def main(args):
     for i in range(chunks_to_process):
         chunk_name = f"chunk_{i:03d}"
         chunk_start_time = time.time()
+        local_start = datetime.now().astimezone()
+        elapsed_hours = (chunk_start_time - total_start_time) / 3600
         print(f"\nProcessing Chunk {i+1} / {total_chunks} ({chunk_name})")
+        print(f"  > Started at: {local_start.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        print(f"  > Project elapsed: {elapsed_hours:.2f}h")
 
         # Use dynamic extension for input chunks
         input_chunk = os.path.join(INPUT_CHUNKS_DIR, f"{chunk_name}{INPUT_EXT}")
@@ -397,7 +450,7 @@ def main(args):
             
             os.makedirs(esrgan_temp_work_dir, exist_ok=True)
 
-            print(f"  > Pre-filtering for VHS (denoise, deblock, sharpen)...")
+            print(f"  > Pre-filtering (denoise, deblock, sharpen)...")
             prefiltered_chunk = os.path.join(esrgan_temp_work_dir, f"{chunk_name}_prefiltered.mp4")
             cmd_prefilter = [
                 "ffmpeg", "-y",
@@ -525,21 +578,35 @@ def main(args):
         
         chunk_end_time = time.time()
         duration_sec = chunk_end_time - chunk_start_time
+        local_end = datetime.now().astimezone()
+        chunk_durations.append(duration_sec)
+
+        # Rolling median ETA (stable across noisy chunks)
+        median_sec = statistics.median(chunk_durations)
+        chunks_remaining = total_chunks - (i + 1)
+        eta_project = local_end + timedelta(seconds=median_sec * chunks_remaining)
+
         print(f"  > Chunk finished in {duration_sec:.2f} seconds.")
+        print(f"  > Finished at: {local_end.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        next_eta = local_end + timedelta(seconds=median_sec)
+        print(f"  > Next chunk ETA (median): {next_eta.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        if chunks_remaining > 0:
+            print(f"  > Project completion ETA: {eta_project.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                  f"({chunks_remaining} chunks × {median_sec/3600:.2f}h median)")
         
         # --- Runtime Limit Check ---
         if args.max_runtime is not None:
             elapsed_hours = (chunk_end_time - total_start_time) / 3600
-            chunk_hours = duration_sec / 3600
+            median_hours = median_sec / 3600
             max_runtime_hours = args.max_runtime
             
             # Check if we should continue to the next chunk
             if i + 1 < chunks_to_process:  # Only check if there are more chunks
-                projected_hours = elapsed_hours + chunk_hours
+                projected_hours = elapsed_hours + median_hours
                 
                 print(f"\n  [Runtime Check]")
                 print(f"    Elapsed: {elapsed_hours:.2f}h / {max_runtime_hours:.2f}h")
-                print(f"    Last chunk: {chunk_hours:.2f}h")
+                print(f"    Last chunk: {duration_sec/3600:.2f}h  |  Median: {median_hours:.2f}h")
                 print(f"    Projected next completion: {projected_hours:.2f}h")
                 
                 if projected_hours > max_runtime_hours:
@@ -551,6 +618,8 @@ def main(args):
                 else:
                     remaining = max_runtime_hours - elapsed_hours
                     print(f"    Continuing (est. {remaining:.2f}h remaining)")
+                    eta_finish_dt = datetime.now().astimezone() + timedelta(hours=remaining)
+                    print(f"    Estimated project completion: {eta_finish_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
     # --- Step 3: Concatenate All Processed Chunks ---
     print("\n--- 3: Concatenating Chunks & Muxing Audio ---")

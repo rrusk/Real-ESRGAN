@@ -87,6 +87,47 @@ def get_video_duration(video_file):
     duration = float(json.loads(result.stdout)["format"]["duration"])
     return duration
 
+def verify_audio_video_duration(video_file, audio_file, tolerance_sec=2.0):
+    """
+    Compares audio and video durations and aborts if they differ beyond tolerance.
+    Catches silent extraction failures (truncation, codec errors) before processing begins.
+    """
+    print(f"  > Verifying audio/video duration match...")
+    try:
+        video_duration = get_video_duration(video_file)
+
+        cmd_audio = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-show_format", "-select_streams", "a:0", audio_file
+        ]
+        result = subprocess.run(cmd_audio, capture_output=True, text=True, check=True)
+        probe = json.loads(result.stdout)
+        streams = probe.get("streams", [])
+        if not streams:
+            raise RuntimeError("ffprobe found no audio streams in extracted audio file.")
+        # Stream-level duration is absent for some codecs (e.g. AC-3 in MKA);
+        # fall back to container-level format duration which is always present.
+        stream_duration = streams[0].get("duration")
+        format_duration = probe.get("format", {}).get("duration")
+        raw = stream_duration or format_duration
+        if raw is None:
+            raise RuntimeError("ffprobe could not determine audio duration from stream or container.")
+        audio_duration = float(raw)
+
+        diff = abs(video_duration - audio_duration)
+        print(f"    Video: {video_duration:.1f}s  |  Audio: {audio_duration:.1f}s  |  Diff: {diff:.1f}s  (tolerance: ±{tolerance_sec}s)")
+
+        if diff > tolerance_sec:
+            raise RuntimeError(
+                f"Audio/video duration mismatch: video={video_duration:.1f}s, "
+                f"audio={audio_duration:.1f}s, diff={diff:.1f}s exceeds ±{tolerance_sec}s tolerance.\n"
+                f"Delete the audio file and re-run to force re-extraction:\n"
+                f"  rm '{audio_file}'"
+            )
+        print(f"    Duration check passed.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffprobe failed during duration check: {e.stderr}")
+
 def get_video_fps(video_file):
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -290,7 +331,8 @@ def main(args):
     
     input_basename = os.path.splitext(os.path.basename(INPUT_VIDEO))[0]
     FINAL_VIDEO_FILE = os.path.join(OUTPUT_DIR, f"{input_basename}_x{SCALE_FACTOR}_rife_FINAL.mkv")
-    ORIGINAL_AUDIO_FILE = os.path.join(PROCESSING_DIR, f"{input_basename}_original.mp3")
+    ORIGINAL_AUDIO_FILE = os.path.join(PROCESSING_DIR, f"{input_basename}_original.mka")  # .mka accepts any codec (AC-3, AAC, PCM, MP3)
+    ORIGINAL_AUDIO_FILE_MP3 = os.path.join(PROCESSING_DIR, f"{input_basename}_original.mp3")  # fallback path
 
     print(f"--- Starting processing for: {INPUT_VIDEO} ---")
     print(f"Detected Input Extension: {INPUT_EXT}")
@@ -354,7 +396,12 @@ def main(args):
     print(f"Using {CHUNK_DURATION_SECONDS}s chunks, splitting into {total_chunks} total chunks.")
     print(f"RIFE output will be {output_fps_float:.3f} FPS.")
 
-    if not os.path.exists(ORIGINAL_AUDIO_FILE) or os.path.getsize(ORIGINAL_AUDIO_FILE) == 0:
+    # Also accept a previously extracted .mp3 fallback from an earlier run
+    if os.path.exists(ORIGINAL_AUDIO_FILE_MP3) and os.path.getsize(ORIGINAL_AUDIO_FILE_MP3) > 0:
+        ORIGINAL_AUDIO_FILE = ORIGINAL_AUDIO_FILE_MP3
+        print(f"Original audio already exists (MP3 fallback): {ORIGINAL_AUDIO_FILE}")
+        verify_audio_video_duration(INPUT_VIDEO, ORIGINAL_AUDIO_FILE)
+    elif not os.path.exists(ORIGINAL_AUDIO_FILE) or os.path.getsize(ORIGINAL_AUDIO_FILE) == 0:
         print(f"Extracting original audio to {ORIGINAL_AUDIO_FILE}...")
         # Attempt lossless passthrough first (preserves original codec, instant)
         audio_copy_ok = False
@@ -379,9 +426,10 @@ def main(args):
                 cmd_audio_mp3 = [
                     "ffmpeg", "-y", "-i", INPUT_VIDEO,
                     "-vn", "-acodec", "libmp3lame", "-q:a", "0",  # q:a 0 = highest VBR quality (~245kbps), handles Hi8/DV fidelity
-                    ORIGINAL_AUDIO_FILE
+                    ORIGINAL_AUDIO_FILE_MP3
                 ]
                 subprocess.run(cmd_audio_mp3, check=True, capture_output=True, text=True)
+                ORIGINAL_AUDIO_FILE = ORIGINAL_AUDIO_FILE_MP3  # point to the actual file produced
                 print(f"  > Audio extracted via MP3 encode fallback (q:a 0, ~245kbps VBR).")
             except subprocess.CalledProcessError as e:
                 print(f"\n--- ERROR: FFmpeg audio extraction failed (both copy and MP3 encode) ---")
@@ -391,8 +439,11 @@ def main(args):
 
         if not os.path.exists(ORIGINAL_AUDIO_FILE) or os.path.getsize(ORIGINAL_AUDIO_FILE) == 0:
             raise RuntimeError(f"Audio extraction failed to produce a valid file: {ORIGINAL_AUDIO_FILE}")
+        verify_audio_video_duration(INPUT_VIDEO, ORIGINAL_AUDIO_FILE)
     else:
         print(f"Original audio already exists: {ORIGINAL_AUDIO_FILE}")
+        verify_audio_video_duration(INPUT_VIDEO, ORIGINAL_AUDIO_FILE)
+
 
     # Use dynamic extension for chunk file pattern
     chunk_file_pattern = os.path.join(INPUT_CHUNKS_DIR, f"chunk_%03d{INPUT_EXT}")

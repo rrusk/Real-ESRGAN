@@ -63,6 +63,37 @@ else
     # -map 0 ensures we bring all streams (if compatible)
     # -movflags +faststart optimizes for web streaming
     ffmpeg -i "$INPUT_FILE" -map 0 -c copy -movflags +faststart "$OUTPUT_FILE"
-    
-    echo -e "\n✅ Success! Remuxed file created: $OUTPUT_FILE"
+
+    echo -e "\n✅ Remux complete: $OUTPUT_FILE"
+
+    # --- SAR / Display Aspect Ratio Fix ---
+    # Read SAR from the source MKV. Non-square pixels are common in legacy video:
+    #   NTSC 4:3  (VHS/Hi8/DV):      SAR 8:9   (720x480 -> display 640x480)
+    #   NTSC 16:9 (widescreen DV):   SAR 32:27 (720x480 -> display 853x480)
+    #   PAL 4:3   (PAL DV/Hi8):      SAR 16:15 (720x576 -> display 768x576)
+    #   PAL 16:9  (PAL widescreen):  SAR 64:45 (720x576 -> display 1024x576)
+    SAR=$(ffprobe -v error -select_streams v:0         -show_entries stream=sample_aspect_ratio         -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE")
+
+    if [[ -z "$SAR" || "$SAR" == "N/A" || "$SAR" == "0:1" || "$SAR" == "1:1" ]]; then
+        echo "SAR is square (1:1) or not set — no display correction needed."
+    else
+        SAR_NUM=$(echo "$SAR" | cut -d: -f1)
+        SAR_DEN=$(echo "$SAR" | cut -d: -f2)
+        PIX_WIDTH=$(ffprobe -v error -select_streams v:0             -show_entries stream=width             -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE")
+        PIX_HEIGHT=$(ffprobe -v error -select_streams v:0             -show_entries stream=height             -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE")
+        DISPLAY_WIDTH=$(python3 -c "print(round($PIX_WIDTH * $SAR_NUM / $SAR_DEN))")
+
+        echo "Source SAR: $SAR — applying PAR $SAR_NUM:$SAR_DEN to MP4 container..."
+        echo "  Pixel: ${PIX_WIDTH}x${PIX_HEIGHT} -> Display: ${DISPLAY_WIDTH}x${PIX_HEIGHT}"
+
+        if ! command -v MP4Box >/dev/null 2>&1; then
+            echo "⚠️  WARNING: MP4Box not found. Install with: sudo apt install gpac"
+            echo "⚠️  Display aspect ratio not corrected in $OUTPUT_FILE"
+        else
+            MP4Box -par "1=${SAR_NUM}:${SAR_DEN}" "$OUTPUT_FILE"
+            echo "✅ Display aspect ratio corrected via MP4Box."
+        fi
+    fi
+
+    echo -e "\n✅ Done! Final file: $OUTPUT_FILE"
 fi

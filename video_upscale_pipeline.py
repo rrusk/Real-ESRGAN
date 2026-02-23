@@ -87,6 +87,89 @@ def get_video_duration(video_file):
     duration = float(json.loads(result.stdout)["format"]["duration"])
     return duration
 
+def get_video_sar(video_file):
+    """
+    Returns the sample aspect ratio (SAR) of the video as a string like '8:9' or '1:1'.
+    Returns None if SAR is not set or is 1:1 (square pixels, no correction needed).
+    Handles all common legacy formats:
+      NTSC 4:3  (VHS/Hi8/DV):     720x480  SAR 8:9   -> display 640x480
+      NTSC 16:9 (widescreen DV):  720x480  SAR 32:27 -> display 853x480
+      PAL 4:3   (PAL DV/Hi8):     720x576  SAR 16:15 -> display 768x576
+      PAL 16:9  (PAL widescreen): 720x576  SAR 64:45 -> display 1024x576
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=sample_aspect_ratio",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_file
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    sar = result.stdout.strip()
+    if not sar or sar in ("N/A", "0:1", "1:1"):
+        return None
+    return sar
+
+def compute_display_width(pixel_width, pixel_height, sar_str):
+    """
+    Computes the correct display width from pixel dimensions and SAR string.
+    e.g. pixel_width=1440, pixel_height=960, sar='8:9' -> display_width=1280
+    Returns pixel_width unchanged if SAR is None or 1:1.
+    """
+    if not sar_str or sar_str in ("N/A", "0:1", "1:1"):
+        return pixel_width
+    try:
+        sar_num, sar_den = map(int, sar_str.split(":"))
+        return round(pixel_width * sar_num / sar_den)
+    except Exception:
+        return pixel_width
+
+def apply_sar_to_file(filepath, sar_str, pixel_width, pixel_height):
+    """
+    Writes correct display dimensions into the container headers using the
+    appropriate tool for the container type:
+      MKV: mkvpropedit (sets display-width/display-height in track headers)
+      MP4: MP4Box -par  (sets pixel aspect ratio atom)
+    These tools write directly to container headers without re-encoding.
+    Falls back with a warning if the required tool is not installed.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    display_width = compute_display_width(pixel_width, pixel_height, sar_str)
+    sar_num, sar_den = sar_str.split(":")
+
+    if ext == ".mkv":
+        tool = "mkvpropedit"
+        if not shutil.which(tool):
+            print(f"  ⚠️  WARNING: {tool} not found. Install with: sudo apt install mkvtoolnix")
+            print(f"  ⚠️  SAR metadata not written to {filepath}. Display may be incorrect.")
+            return False
+        cmd = [
+            tool, filepath,
+            "--edit", "track:v1",
+            "--set", f"display-width={display_width}",
+            "--set", f"display-height={pixel_height}"
+        ]
+        label = f"display {display_width}x{pixel_height}"
+    elif ext == ".mp4":
+        tool = "MP4Box"
+        if not shutil.which(tool):
+            print(f"  ⚠️  WARNING: {tool} not found. Install with: sudo apt install gpac")
+            print(f"  ⚠️  SAR metadata not written to {filepath}. Display may be incorrect.")
+            return False
+        cmd = [tool, "-par", f"1={sar_num}:{sar_den}", filepath]
+        label = f"PAR {sar_num}:{sar_den}"
+    else:
+        print(f"  ⚠️  WARNING: Unsupported container {ext} for SAR fix. Skipping.")
+        return False
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ⚠️  WARNING: SAR fix failed for {filepath}:")
+        print(f"    {result.stderr.strip()}")
+        return False
+
+    print(f"  > SAR fix applied ({label}) to {os.path.basename(filepath)}")
+    return True
+
 def verify_audio_video_duration(video_file, audio_file, tolerance_sec=2.0):
     """
     Compares audio and video durations and aborts if they differ beyond tolerance.
@@ -127,6 +210,25 @@ def verify_audio_video_duration(video_file, audio_file, tolerance_sec=2.0):
         print(f"    Duration check passed.")
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"ffprobe failed during duration check: {e.stderr}")
+
+def is_valid_video(filepath):
+    """
+    Probes a video file with ffprobe to confirm it has a readable video stream.
+    Catches corrupt files (e.g. missing moov atom) that have non-zero size but
+    are unplayable due to an interrupted write.
+    """
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_type",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            filepath
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return result.returncode == 0 and result.stdout.strip() == "video"
+    except Exception:
+        return False
 
 def get_video_fps(video_file):
     cmd = [
@@ -391,6 +493,11 @@ def main(args):
     source_fps_str = get_video_fps(INPUT_VIDEO)
     source_fps_float = float(source_fps_str)
     output_fps_float = source_fps_float * 2
+    source_sar = get_video_sar(INPUT_VIDEO)
+    if source_sar:
+        print(f"Source SAR detected: {source_sar} (non-square pixels — will be preserved in final output.)")
+    else:
+        print(f"Source SAR: 1:1 (square pixels)")
     total_chunks = math.ceil(duration / CHUNK_DURATION_SECONDS)
     print(f"Video detected: {duration:.2f}s, {source_fps_str} FPS.")
     print(f"Using {CHUNK_DURATION_SECONDS}s chunks, splitting into {total_chunks} total chunks.")
@@ -488,15 +595,23 @@ def main(args):
         rife_output_file = os.path.join(RIFE_CHUNKS_DIR, f"{chunk_name}_rife.mp4")
 
         if os.path.exists(rife_output_file) and os.path.getsize(rife_output_file) > 0:
-            print(f"  > Chunk already processed. Skipping.")
-            cleanup_intermediate_files(input_chunk, esrgan_output_file, rife_in_frames_dir, rife_out_frames_dir)
-            continue
+            if is_valid_video(rife_output_file):
+                print(f"  > Chunk already processed. Skipping.")
+                cleanup_intermediate_files(input_chunk, esrgan_output_file, rife_in_frames_dir, rife_out_frames_dir)
+                continue
+            else:
+                print(f"  > WARNING: {rife_output_file} exists but is corrupt (missing moov atom or no video stream). Reprocessing.")
+                os.remove(rife_output_file)
         
         if not os.path.exists(input_chunk):
             print(f"  > WARNING: Input chunk {input_chunk} missing. Skipping.")
             continue
 
         # --- Step 1: Run Real-ESRGAN ---
+        if os.path.exists(esrgan_output_file) and os.path.getsize(esrgan_output_file) > 0 and not is_valid_video(esrgan_output_file):
+            print(f"  > WARNING: {esrgan_output_file} is corrupt. Deleting and reprocessing from ESRGAN.")
+            os.remove(esrgan_output_file)
+            safe_rmtree(esrgan_temp_work_dir)
         if not os.path.exists(esrgan_output_file) or os.path.getsize(esrgan_output_file) == 0:
             
             os.makedirs(esrgan_temp_work_dir, exist_ok=True)
@@ -520,6 +635,9 @@ def main(args):
                 print("STDOUT:", e.stdout)
                 print("STDERR:", e.stderr)
                 raise
+
+            if not is_valid_video(prefiltered_chunk):
+                raise RuntimeError(f"Pre-filter produced a corrupt output file: {prefiltered_chunk}")
 
             print(f"  > Running Real-ESRGAN...")
             cmd_realesrgan = [
@@ -557,40 +675,55 @@ def main(args):
             print(f"  > Found existing Real-ESRGAN output, skipping to RIFE.")
 
         # --- Step 2: Run RIFE (Multi-Step) ---
-        print(f"  > Extracting frames for RIFE...")
-        os.makedirs(rife_in_frames_dir, exist_ok=True)
-        cmd_extract = [
-            "ffmpeg", "-i", esrgan_output_file,
-            os.path.join(rife_in_frames_dir, "frame_%08d.png")
-        ]
-        try:
-            with Timer(f"{chunk_name} RIFE Frame Extraction"):
-                subprocess.run(cmd_extract, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            print(f"\n--- ERROR: FFmpeg frame extraction failed on {chunk_name} ---")
-            print("STDOUT:", e.stdout)
-            print("STDERR:", e.stderr)
-            raise
+        # Check if RIFE input frames already exist and are complete
+        existing_in_frames = glob.glob(os.path.join(rife_in_frames_dir, "*.png")) if os.path.isdir(rife_in_frames_dir) else []
+        if existing_in_frames:
+            print(f"  > Found {len(existing_in_frames)} existing RIFE input frames, skipping extraction.")
+        else:
+            print(f"  > Extracting frames for RIFE...")
+            os.makedirs(rife_in_frames_dir, exist_ok=True)
+            cmd_extract = [
+                "ffmpeg", "-i", esrgan_output_file,
+                os.path.join(rife_in_frames_dir, "frame_%08d.png")
+            ]
+            try:
+                with Timer(f"{chunk_name} RIFE Frame Extraction"):
+                    subprocess.run(cmd_extract, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                print(f"\n--- ERROR: FFmpeg frame extraction failed on {chunk_name} ---")
+                print("STDOUT:", e.stdout)
+                print("STDERR:", e.stderr)
+                raise
 
-        print(f"  > Running RIFE (directory mode)...")
-        os.makedirs(rife_out_frames_dir, exist_ok=True)
-        cmd_rife = [ 
-            RIFE_BIN, 
-            "-i", rife_in_frames_dir, 
-            "-o", rife_out_frames_dir,
-            "-s", "0.5"
-        ]
-        try:
-            with Timer(f"{chunk_name} RIFE Interpolation"):
-                subprocess.run(cmd_rife, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            print(f"\n--- ERROR: RIFE failed on {chunk_name} ---")
-            print("STDOUT:", e.stdout)
-            print("STDERR:", e.stderr)
-            raise
-        
-        print("  > Verifying RIFE frame count...")
         in_frames = glob.glob(os.path.join(rife_in_frames_dir, "*.png"))
+        existing_out_frames = glob.glob(os.path.join(rife_out_frames_dir, "*.png")) if os.path.isdir(rife_out_frames_dir) else []
+        expected_out = len(in_frames) * 2
+        if len(existing_out_frames) >= expected_out - 2:
+            print(f"  > Found {len(existing_out_frames)} existing RIFE output frames (expected ~{expected_out}), skipping interpolation.")
+            out_frames = existing_out_frames
+        else:
+            if existing_out_frames:
+                print(f"  > WARNING: Found only {len(existing_out_frames)}/{expected_out} RIFE output frames (partial). Wiping and re-interpolating.")
+                safe_rmtree(rife_out_frames_dir)
+            print(f"  > Running RIFE (directory mode)...")
+            os.makedirs(rife_out_frames_dir, exist_ok=True)
+            cmd_rife = [ 
+                RIFE_BIN, 
+                "-i", rife_in_frames_dir, 
+                "-o", rife_out_frames_dir,
+                "-s", "0.5"
+            ]
+            try:
+                with Timer(f"{chunk_name} RIFE Interpolation"):
+                    subprocess.run(cmd_rife, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                print(f"\n--- ERROR: RIFE failed on {chunk_name} ---")
+                print("STDOUT:", e.stdout)
+                print("STDERR:", e.stderr)
+                raise
+            out_frames = glob.glob(os.path.join(rife_out_frames_dir, "*.png"))
+
+        print("  > Verifying RIFE frame count...")
         out_frames = glob.glob(os.path.join(rife_out_frames_dir, "*.png"))
         
         if len(out_frames) < len(in_frames) * 2 - 2:
@@ -704,6 +837,7 @@ def main(args):
 
     print(f"Concatenation list created: {CONCAT_FILE}")
 
+    # Concat: always use plain stream copy, apply SAR after via container tools
     cmd_concat = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", CONCAT_FILE,
@@ -724,6 +858,14 @@ def main(args):
         print("STDERR:", e.stderr)
         print(f"If this is a 'non-monotonic DTS' error, change -c:v copy to -c:v libx264 in the script and re-run.")
         raise
+
+    # Apply SAR to final output using container-native tools (no re-encode)
+    if source_sar:
+        out_width, out_height = get_video_dimensions(FINAL_VIDEO_FILE)
+        print(f"Applying SAR {source_sar} to final output (pixel {out_width}x{out_height} -> display {compute_display_width(out_width, out_height, source_sar)}x{out_height})...")
+        apply_sar_to_file(FINAL_VIDEO_FILE, source_sar, out_width, out_height)
+    else:
+        print(f"Source has square pixels (SAR 1:1) — no SAR correction needed.")
 
     # --- Final Cleanup ---
     total_end_time = time.time()

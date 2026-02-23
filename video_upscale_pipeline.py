@@ -29,6 +29,7 @@ INPUT_CHUNKS_DIR = os.path.join(PROCESSING_DIR, "0_input_chunks")
 ESRGAN_CHUNKS_DIR = os.path.join(PROCESSING_DIR, "1_esrgan_chunks")
 RIFE_CHUNKS_DIR = os.path.join(PROCESSING_DIR, "2_rife_chunks")
 CONCAT_FILE = os.path.join(PROCESSING_DIR, "concat_list.txt")
+STOP_FILE = os.path.join(PROCESSING_DIR, "STOP")  # Touch this file to request a graceful stop after the current chunk
 TEST_MODE_CHUNKS = None
 
 
@@ -584,6 +585,7 @@ def main(args):
         print(f"\nProcessing Chunk {i+1} / {total_chunks} ({chunk_name})")
         print(f"  > Started at: {local_start.strftime('%Y-%m-%d %H:%M:%S %Z')}")
         print(f"  > Project elapsed: {elapsed_hours:.2f}h")
+        print(f"  > To stop after this chunk: touch {STOP_FILE}")
 
         # Use dynamic extension for input chunks
         input_chunk = os.path.join(INPUT_CHUNKS_DIR, f"{chunk_name}{INPUT_EXT}")
@@ -804,6 +806,14 @@ def main(args):
                     print(f"    Continuing (est. {remaining:.2f}h remaining)")
                     eta_finish_dt = datetime.now().astimezone() + timedelta(hours=remaining)
                     print(f"    Estimated project completion: {eta_finish_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+        # --- Graceful Stop File Check ---
+        if os.path.exists(STOP_FILE):
+            os.remove(STOP_FILE)
+            print(f"\n  ⏸️  GRACEFUL STOP: '{STOP_FILE}' detected.")
+            print(f"    Finished chunk {i+1}/{total_chunks}.")
+            print(f"    Resume anytime — script will continue from chunk {i+1}.")
+            break
 
     # --- Step 3: Concatenate All Processed Chunks ---
     print("\n--- 3: Concatenating Chunks & Muxing Audio ---")

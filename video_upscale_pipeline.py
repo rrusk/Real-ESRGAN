@@ -570,6 +570,13 @@ def main(args):
 
     # --- Steps 1 & 2: Process Chunks in a Loop ---
     print("\n--- 1. & 2. Processing All Chunks ---")
+
+    # Clear any stale STOP file left over from a previous session (e.g. a session
+    # that hit the runtime limit before it could reach the STOP-file check).
+    if os.path.exists(STOP_FILE):
+        os.remove(STOP_FILE)
+        print(f"[INFO] Removed stale STOP file from previous session: {STOP_FILE}")
+
     total_start_time = time.time()
     chunks_to_process = total_chunks
     chunk_durations = []  # Rolling history for median ETA
@@ -584,6 +591,11 @@ def main(args):
         elapsed_hours = (chunk_start_time - total_start_time) / 3600
         print(f"\nProcessing Chunk {i+1} / {total_chunks} ({chunk_name})")
         print(f"  > Started at: {local_start.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        if chunk_durations:
+            chunk_eta = local_start + timedelta(seconds=statistics.median(chunk_durations))
+            print(f"  > Estimated completion: {chunk_eta.strftime('%Y-%m-%d %H:%M:%S %Z')} (median {statistics.median(chunk_durations)/3600:.2f}h)")
+        else:
+            print(f"  > Estimated completion: unknown (first chunk)")
         print(f"  > Project elapsed: {elapsed_hours:.2f}h")
         print(f"  > To stop after this chunk: touch {STOP_FILE}")
 
@@ -799,13 +811,17 @@ def main(args):
                     print(f"\n  ⏸️  GRACEFUL SHUTDOWN: Would exceed {max_runtime_hours}h runtime limit.")
                     print(f"    Processed {i+1}/{total_chunks} chunks successfully.")
                     print(f"    Resume anytime - script will continue from chunk {i+1}.")
+                    # Remove any STOP file so it doesn't interfere with the next run
+                    if os.path.exists(STOP_FILE):
+                        os.remove(STOP_FILE)
+                        print(f"    (Removed stale STOP file to prevent interference on next run)")
                     # Exit the chunk loop cleanly
                     break
                 else:
                     remaining = max_runtime_hours - elapsed_hours
-                    print(f"    Continuing (est. {remaining:.2f}h remaining)")
                     eta_finish_dt = datetime.now().astimezone() + timedelta(hours=remaining)
-                    print(f"    Estimated project completion: {eta_finish_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                    print(f"    Continuing  ({remaining:.2f}h remaining)")
+                    print(f"    This run will complete at or before {eta_finish_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
         # --- Graceful Stop File Check ---
         if os.path.exists(STOP_FILE):

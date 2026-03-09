@@ -26,8 +26,11 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "  mask_pixels     (Optional) Number of pixels to black out at the bottom."
     echo "                  *** Use EVEN numbers (8, 10, 12) for best results. ***"
     echo "  --test          (Optional) Process only the first 30s for quick mask review."
-    echo "  --aac           (Optional) Force AAC audio encoding even for compressed sources."
-
+    echo "  --aac           (Optional) Force AAC encoding (192k lossy) instead of"
+    echo "                  preserving PCM audio bit-for-bit. When PCM is detected,"
+    echo "                  the default behaviour is to write a .mkv master (which"
+    echo "                  supports PCM natively) rather than lossy-encode to AAC."
+    echo "                  Use --aac only if you specifically need an MP4 master."
     echo ""
     echo "How to select mask_pixels:"
     echo "  1. Play your video in VLC and look at the bottom edge."
@@ -103,16 +106,28 @@ PROBE_LOG=$(python3 probe_video.py "$SOURCE_INPUT")
 echo "$PROBE_LOG"
 
 # 3. Audio Strategy Detection
-# Detects source codec and determines if re-encoding or bitstream copying is required.
+# Detects source codec and determines re-encoding or preservation strategy.
+#
+# MP4 does not support PCM audio. When PCM is detected the output container
+# is switched to MKV, which supports PCM natively, and audio is stream-copied
+# bit-for-bit. The upscale pipeline detects the input extension dynamically
+# and handles MKV masters correctly.
+#
+# Use --aac to force AAC and keep an MP4 master (e.g. for device compatibility).
 AUDIO_FORMAT=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$SOURCE_INPUT")
 
 if [[ "$FORCE_AAC" == true ]]; then
+    # User explicitly requested AAC — output stays .mp4.
     AUDIO_CMD="-c:a aac -b:a 192k"
-    AUDIO_PLAN="CONVERT (Forced AAC)"
+    AUDIO_PLAN="CONVERT (Forced AAC — 192k lossy, MP4 output)"
 elif [[ "$AUDIO_FORMAT" == pcm* ]]; then
-    # MP4 containers require compressed audio; PCM must be transcoded.
-    AUDIO_CMD="-c:a aac -b:a 192k"
-    AUDIO_PLAN="CONVERT (PCM to AAC for MP4 compatibility)"
+    # PCM cannot be muxed into MP4. Switch container to MKV so audio can be
+    # stream-copied without re-encoding. The upscale pipeline handles .mkv input.
+    AUDIO_CMD="-c:a copy"
+    AUDIO_PLAN="LOSSLESS (PCM preserved bit-for-bit — switching output to .mkv)"
+    PROG_OUTPUT="${PROG_OUTPUT%.mp4}.mkv"
+    echo -e "\n[INFO] PCM audio detected. Output container changed to .mkv to preserve"
+    echo "       audio bit-for-bit. Use --aac to force MP4 output with AAC instead."
 else
     # Preserves original compressed audio to maintain sync and quality.
     AUDIO_CMD="-c:a copy"
@@ -145,7 +160,14 @@ echo "Audio Plan:    $AUDIO_PLAN"
 echo "Bottom Mask:   ${MASK_PIXELS} pixels"
 
 if echo "$PROBE_LOG" | grep -q "Interlaced"; then
-    VIDEO_PLAN="HIGH-QUALITY DEINTERLACING (bwdif)"
+    if echo "$SCAN_TYPE" | grep -q "TFF"; then
+        FIELD_ORDER="TFF (Top Field First)"
+    elif echo "$SCAN_TYPE" | grep -q "BFF"; then
+        FIELD_ORDER="BFF (Bottom Field First)"
+    else
+        FIELD_ORDER="Unknown — bwdif will auto-detect"
+    fi
+    VIDEO_PLAN="HIGH-QUALITY DEINTERLACING (bwdif) — Field Order: ${FIELD_ORDER}"
     echo "Video Plan:    $VIDEO_PLAN"
     echo -e "\n⚠️  WARNING: Deinterlacing is a CPU-intensive process."
     echo "    Depending on video length, this will take quite awhile."
@@ -165,7 +187,7 @@ fi
 # 6. Processing
 if echo "$PROBE_LOG" | grep -q "Interlaced"; then
     echo -e "\n--- Step 2: High-Quality Deinterlacing ($SCAN_TYPE) ---"
-    
+
     # Filter Chain: bwdif mode=0 (29.97i -> 29.97p), yuv420p format, and optional drawbox.
     FILTER_CHAIN="bwdif=mode=0:parity=${PARITY}:deint=0,format=yuv420p"
     if [ "$MASK_PIXELS" -gt 0 ]; then
@@ -174,9 +196,10 @@ if echo "$PROBE_LOG" | grep -q "Interlaced"; then
     fi
 
     echo "Generating master: $PROG_OUTPUT"
-    
+
     # -crf 16 and -preset slower prioritize data retention for the subsequent AI upscale.
     # -field_order progressive prevents subsequent probe hits for interlaced metadata.
+    # -movflags +faststart is MP4-specific but harmless on MKV (ignored silently).
     ffmpeg -y $FFLAGS -i "$SOURCE_INPUT" $LIMIT_CMD \
         -vf "$FILTER_CHAIN" \
         -c:v libx264 -threads 8 -crf 16 -preset slower \
@@ -184,7 +207,7 @@ if echo "$PROBE_LOG" | grep -q "Interlaced"; then
         -movflags +faststart \
         $AUDIO_CMD \
         "$PROG_OUTPUT"
-    
+
     echo -e "\n✅ Success! Deinterlaced Master Created: $PROG_OUTPUT"
 else
     echo -e "\n--- Step 2: No Deinterlacing Needed ---"

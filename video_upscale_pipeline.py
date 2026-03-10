@@ -351,10 +351,17 @@ def parse_arguments():
         description="Upscale and interpolate legacy video files (VHS, Hi8, DV camcorder, etc.).",
         epilog="""
 Examples:
-  %(prog)s video.avi             # 2x upscaling (default)
-  %(prog)s video.avi --scale 4   # 4x upscaling
-  %(prog)s video.avi -s 4 --force # 4x upscaling, no cleanup prompt
-  %(prog)s camcorder.mp4         # works with DV, Hi8, and other camcorder formats
+  %(prog)s video.avi                         # 2x upscale, Balanced profile (default)
+  %(prog)s video.avi --scale 4               # 4x upscale, Balanced profile
+  %(prog)s video.avi -s 4 --force            # 4x upscale, no cleanup prompt
+  %(prog)s video.avi --legacy-filter         # Original aggressive profile (low-bitrate/composite sources)
+  %(prog)s video.avi --halo-aware            # Halo suppression (white ghost lines around dark edges)
+  %(prog)s camcorder.mp4                     # works with DV, Hi8, and other camcorder formats
+
+Pre-filter profiles (mutually exclusive):
+  default          Balanced — Hi8/S-Video -> HQ DVD (6.5Mbps). hqdn3d=2:2:5:5, pp=fd, unsharp=0.2
+  --legacy-filter  Original — low-bitrate or composite-captured sources. hqdn3d=3:3:6:6, pp=ac, unsharp=0.6
+  --halo-aware     Halo fix — white ringing around dark edges. hqdn3d=4:4:8:8, pp=fd, unsharp=0.2
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -364,7 +371,7 @@ Examples:
         type=int, 
         choices=[2, 4], 
         default=2, 
-        help="Upscale factor: 2 (for RealESRGAN_x2plus) or 4 (for realesr-general-x4v3). Default: 2"
+        help="Upscale factor: 2 (for RealESRGAN_x2plus) or 4 (for RealESRGAN_x4plus). Default: 2"
     )
     parser.add_argument(
         "--threads",
@@ -380,7 +387,17 @@ Examples:
     parser.add_argument(
         "--halo-aware", 
         action="store_true", 
-        help="Adjust pre-filters to reduce enhancement of existing halo/ringing artifacts (useful for VHS and analog camcorder sources)."
+        help="Suppress ringing/halo artifacts: increases denoising and minimises sharpening. "
+             "Use only if you see white ghost lines around dark edges in the output. "
+             "Mutually exclusive with --legacy-filter."
+    )
+    parser.add_argument(
+        "--legacy-filter",
+        action="store_true",
+        help="Use the original aggressive pre-filter profile (hqdn3d=3:3:6:6, pp=ac, unsharp=0.6). "
+             "Intended for heavily compressed or composite-captured sources (low-bitrate DVD, VHS via composite). "
+             "The default Balanced profile is recommended for Hi8/S-Video -> HQ DVD (6.5Mbps) sources. "
+             "Mutually exclusive with --halo-aware."
     )
     parser.add_argument(
         "--max-runtime",
@@ -406,14 +423,42 @@ def main(args):
     # Detect extension to support both .avi and .mp4
     INPUT_EXT = os.path.splitext(INPUT_VIDEO)[1]
     
-    # Set default pre-filter values (tuned for analog/legacy video sources)
-    # Original: hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6
+    # --- Pre-filter Profile Selection ---
+    # Three mutually exclusive profiles selected by command-line flags.
+    # Default (no flags): Balanced — tuned for Hi8/S-Video -> HQ DVD (6.5Mbps) sources.
+    #
+    # Profile comparison:
+    #   Balanced (default) hqdn3d=2:2:5:5, pp=fd, unsharp=0.2
+    #     Light spatial denoise preserves texture for ESRGAN. Moderate temporal
+    #     smoothing provides frame consistency for RIFE without blurring motion.
+    #     pp=fd handles DVD macroblocking without the 'waxy' over-smoothing of pp=ac.
+    #     Minimal sharpening avoids introducing pre-upscale halos.
+    #
+    #   Halo-Aware        hqdn3d=4:4:8:8, pp=fd, unsharp=0.2
+    #     Heavier denoise suppresses the source ringing that ESRGAN would otherwise
+    #     amplify. Use only if you see white ghost lines around dark edges in output.
+    #
+    #   Legacy            hqdn3d=3:3:6:6, pp=ac, unsharp=0.6
+    #     Original aggressive profile. Suited to low-bitrate or composite-captured
+    #     sources (e.g. heavily compressed DVD, VHS via composite connection) where
+    #     stronger deblocking and denoising are warranted. pp=ac full deblock+dering.
+
+    if args.halo_aware and args.legacy_filter:
+        print("ERROR: --halo-aware and --legacy-filter are mutually exclusive. Pick one.")
+        sys.exit(1)
+
     if args.halo_aware:
-        # Reduced sharpening and slightly increased denoise to soften halos
-        prefilter_vf = "hqdn3d=4:4:8:8,pp=ac,unsharp=3:3:0.2"
-        print("   [Mode] Halo-Aware filtering enabled (softened sharpening, recommended for VHS/Hi8 with existing ringing artifacts).")
-    else:
+        prefilter_vf = "hqdn3d=4:4:8:8,pp=fd,unsharp=3:3:0.2"
+        print("   [Mode] Halo-Aware: Heavy denoise, fast deblock, minimal sharpen. "
+              "Use if you see white ghost lines around dark edges.")
+    elif args.legacy_filter:
         prefilter_vf = "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6"
+        print("   [Mode] Legacy: Original aggressive profile (hqdn3d=3:3:6:6, pp=ac, unsharp=0.6). "
+              "Recommended for low-bitrate DVD or composite-captured sources.")
+    else:
+        prefilter_vf = "hqdn3d=2:2:5:5,pp=fd,unsharp=3:3:0.2"
+        print("   [Mode] Balanced (default): Optimised for Hi8/S-Video -> HQ DVD (6.5Mbps). "
+              "Light spatial denoise, moderate temporal stability, fast deblock, minimal sharpen.")
 
     # Calculate FFmpeg thread count
     if args.threads and args.threads > 0:
@@ -430,7 +475,7 @@ def main(args):
     if SCALE_FACTOR == 2:
         REALSRGAN_MODEL = "RealESRGAN_x2plus"
     elif SCALE_FACTOR == 4:
-        REALSRGAN_MODEL = "realesr-general-x4v3"
+        REALSRGAN_MODEL = "RealESRGAN_x4plus"
     
     input_basename = os.path.splitext(os.path.basename(INPUT_VIDEO))[0]
     FINAL_VIDEO_FILE = os.path.join(OUTPUT_DIR, f"{input_basename}_x{SCALE_FACTOR}_rife_FINAL.mkv")

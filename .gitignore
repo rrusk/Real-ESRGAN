@@ -139,9 +139,9 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# --- VHS Pipeline Specifics ---
+# --- Video Pipeline Specifics ---
 # Machine learning models
-models/
+#models/
 
 # RIFE binaries and archives
 rife-ncnn-vulkan

@@ -134,8 +134,54 @@ else
     AUDIO_PLAN="LOSSLESS (Bitstream copy of $AUDIO_FORMAT)"
 fi
 
-# 4. Decision Logic (Dynamic Handling of Field Order and Timestamps)
-SCAN_TYPE=$(echo "$PROBE_LOG" | grep "Scan Type:" | awk -F': ' '{print $2}')
+# 4. Field Order and Scan Type Detection
+#
+# Primary: query ffprobe stream=field_order directly. This returns clean tokens:
+#   'progressive', 'tt' (TFF), 'bb' (BFF), 'tb', 'bt', or 'unknown'.
+# Fallback: parse probe_video.py output for interlace detection when ffprobe
+#   returns 'unknown' or empty (common with DV-in-AVI and some MPEG sources).
+#
+FFPROBE_FIELD_ORDER=$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=field_order \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$SOURCE_INPUT")
+
+# Normalise to upper-case for consistent matching
+FFPROBE_FIELD_ORDER_UC="${FFPROBE_FIELD_ORDER^^}"
+
+if [[ "$FFPROBE_FIELD_ORDER_UC" == "PROGRESSIVE" ]]; then
+    IS_INTERLACED=false
+    PARITY="-1"
+    FIELD_ORDER="Progressive"
+elif [[ "$FFPROBE_FIELD_ORDER_UC" == "TT" ]]; then
+    IS_INTERLACED=true
+    PARITY="0"
+    FIELD_ORDER="TFF (Top Field First)"
+elif [[ "$FFPROBE_FIELD_ORDER_UC" == "BB" || "$FFPROBE_FIELD_ORDER_UC" == "BT" ]]; then
+    IS_INTERLACED=true
+    PARITY="1"
+    FIELD_ORDER="BFF (Bottom Field First)"
+else
+    # ffprobe returned 'unknown' or empty — fall back to probe_video.py output
+    SCAN_TYPE=$(echo "$PROBE_LOG" | grep "Scan Type:" | awk -F': ' '{print $2}')
+    if echo "$PROBE_LOG" | grep -q "Interlaced"; then
+        IS_INTERLACED=true
+        if echo "$SCAN_TYPE" | grep -q "TFF"; then
+            PARITY="0"
+            FIELD_ORDER="TFF (Top Field First, from probe fallback)"
+        elif echo "$SCAN_TYPE" | grep -q "BFF"; then
+            PARITY="1"
+            FIELD_ORDER="BFF (Bottom Field First, from probe fallback)"
+        else
+            PARITY="-1"
+            FIELD_ORDER="Unknown — bwdif will auto-detect"
+        fi
+    else
+        IS_INTERLACED=false
+        PARITY="-1"
+        FIELD_ORDER="Progressive (from probe fallback)"
+    fi
+fi
 
 # PTS Regeneration if probe_video.py detects broken or unrealistic durations.
 FFLAGS=""
@@ -143,11 +189,6 @@ if echo "$PROBE_LOG" | grep -q "unrealistic"; then
     echo "Detected broken timestamps. Enabling PTS regeneration..."
     FFLAGS="-fflags +genpts"
 fi
-
-# Determine Field Parity based on Probe results for bwdif filter.
-PARITY="-1" # Default Auto
-if echo "$SCAN_TYPE" | grep -q "TFF"; then PARITY="0"; fi
-if echo "$SCAN_TYPE" | grep -q "BFF"; then PARITY="1"; fi
 
 # 5. Pre-Flight Summary & Confirmation
 # Summarizes both Video and Audio plans before committing to a long encode.
@@ -159,14 +200,7 @@ echo "Output File:   $PROG_OUTPUT"
 echo "Audio Plan:    $AUDIO_PLAN"
 echo "Bottom Mask:   ${MASK_PIXELS} pixels"
 
-if echo "$PROBE_LOG" | grep -q "Interlaced"; then
-    if echo "$SCAN_TYPE" | grep -q "TFF"; then
-        FIELD_ORDER="TFF (Top Field First)"
-    elif echo "$SCAN_TYPE" | grep -q "BFF"; then
-        FIELD_ORDER="BFF (Bottom Field First)"
-    else
-        FIELD_ORDER="Unknown — bwdif will auto-detect"
-    fi
+if [ "$IS_INTERLACED" = true ]; then
     VIDEO_PLAN="HIGH-QUALITY DEINTERLACING (bwdif) — Field Order: ${FIELD_ORDER}"
     echo "Video Plan:    $VIDEO_PLAN"
     echo -e "\n⚠️  WARNING: Deinterlacing is a CPU-intensive process."
@@ -185,8 +219,8 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
 fi
 
 # 6. Processing
-if echo "$PROBE_LOG" | grep -q "Interlaced"; then
-    echo -e "\n--- Step 2: High-Quality Deinterlacing ($SCAN_TYPE) ---"
+if [ "$IS_INTERLACED" = true ]; then
+    echo -e "\n--- Step 2: High-Quality Deinterlacing (${FIELD_ORDER}) ---"
 
     # Filter Chain: bwdif mode=0 (29.97i -> 29.97p), yuv420p format, and optional drawbox.
     FILTER_CHAIN="bwdif=mode=0:parity=${PARITY}:deint=0,format=yuv420p"

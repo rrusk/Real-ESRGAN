@@ -40,11 +40,14 @@ chmod u+x rife-ncnn-vulkan/rife-ncnn-vulkan
 
 ### Pre-trained Models (.pth)
 
+Available Real-ESRGAN models are described at https://github.com/xinntao/Real-ESRGAN/blob/master/docs/model_zoo.md.
+
 Run the following block in your terminal to create the `models` directory and download the required weights:
 
 ```bash
 mkdir -p models
 wget -O models/RealESRGAN_x2plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth
+wget -O models/RealESRGAN_x4plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 wget -O models/realesr-general-x4v3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
 
 ```

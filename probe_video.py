@@ -153,7 +153,7 @@ def detect_interlace(input_file, frames=500):
 # UNIVERSAL DATA HEALTH (Bits Per Pixel Logic)
 # ==============================================================================
 def check_bitrate_health(meta, input_file):
-    """Universal health check based on Bits Per Pixel (bpp)."""
+    """Universal health check based on Bits Per Pixel (bpp) and Resolution."""
     try:
         file_size_bits = os.path.getsize(input_file) * 8
         
@@ -183,19 +183,25 @@ def check_bitrate_health(meta, input_file):
         if 'yuyv' in pix_fmt or 'raw' in pix_fmt:
             target = 16.0  # Uncompressed 4:2:2 baseline
         else:
-            target = 0.15  # High-quality H.264 baseline
+            target = 0.20  # Increased from 0.15 to better reflect archival H.264
             
-        ratio = bpp / target
+        # 4. Resolution Multiplier (Penalty for sub-SD content)
+        # Archival Standard is 720x480 (345,600 pixels)
+        pixel_count = width * height
+        res_multiplier = min(1.0, pixel_count / 345600)
+        
+        # Final Score: BPP accuracy adjusted by how much detail is actually present
+        ratio = (bpp / target) * res_multiplier
 
-        # 4. Universal Labels
-        if ratio >= 0.9: 
-            return f"Excellent ({bitrate_mbps:.2f} Mbps) - High Detail Retention"
+        # 5. Universal Labels
+        if ratio >= 0.85 and width >= 720: 
+            return f"Excellent ({bitrate_mbps:.2f} Mbps) - Archival Quality"
         elif ratio >= 0.6: 
             return f"Good ({bitrate_mbps:.2f} Mbps) - Standard Quality"
         elif ratio >= 0.3: 
-            return f"Fair ({bitrate_mbps:.2f} Mbps) - Compressed"
+            return f"Fair ({bitrate_mbps:.2f} Mbps) - Compressed/Low-Res"
         else: 
-            return f"Poor ({bitrate_mbps:.2f} Mbps) - Heavily Compressed"
+            return f"Poor ({bitrate_mbps:.2f} Mbps) - Sub-standard Archive"
 
     except Exception as e:
         return f"Unknown Error: {e}"

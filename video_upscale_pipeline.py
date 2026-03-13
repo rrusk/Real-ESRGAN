@@ -360,7 +360,7 @@ Examples:
   %(prog)s camcorder.mp4                     # works with DV, Hi8, and other camcorder formats
 
 Pre-filter profiles (--profile):
-  balanced   Default. Hi8/S-Video -> HQ DVD (6.5Mbps).        hqdn3d=2:2:6:6,     pp=fd, unsharp=3:3:0.2
+  balanced   Default. Hi8/S-Video capture -> DVD (~4.6Mbps).   hqdn3d=2:2:6:6,     pp=fd, unsharp=3:3:0.2
   aggressive Heavy noise, composite captures, low-bitrate DVD. hqdn3d=3:3:6:6,     pp=ac, unsharp=3:3:0.6
   halo       White ghost lines / ringing around dark edges.    hqdn3d=4:4:8:8,     pp=fd, unsharp=3:3:0.2
   dv         MiniDV / Digital8 / DV AVI sources.               hqdn3d=1.5:1.5:4:4, pp=ac, unsharp=3:3:0.25
@@ -392,7 +392,7 @@ Pre-filter profiles (--profile):
         default="balanced",
         help=(
             "Pre-filter profile (default: balanced). "
-            "balanced:   Hi8/S-Video -> HQ DVD. Light denoise, temporal 6:6 stability, fast deblock, minimal sharpen. "
+            "balanced:   Hi8/S-Video capture -> DVD (~4.6Mbps source). Light denoise, temporal 6:6 stability, fast deblock, minimal sharpen. "
             "aggressive: Heavy noise, composite captures, or low-bitrate DVD. Stronger denoise, full deblock+dering, more sharpen. "
             "halo:       White ghost lines around dark edges. Heavy denoise, fast deblock, minimal sharpen. "
             "dv:         MiniDV/Digital8/DV AVI. Lighter denoise, stronger deblock+dering, gentle sharpen."
@@ -430,7 +430,9 @@ def main(args):
     #     Light spatial denoise preserves texture for ESRGAN. Temporal at 6:6 stabilises
     #     frame-to-frame flicker without touching real detail. pp=fd handles DVD
     #     macroblocking. Minimal sharpening avoids pre-upscale halos.
-    #     Tuned for Hi8/S-Video -> HQ DVD (6.5Mbps) sources.
+    #     Tuned for Hi8/S-Video capture -> DVD (~4.6Mbps source). Note: the
+    #     deinterlaced master produced by prepare_video.sh will be ~6.5Mbps;
+    #     the relevant quality level is the DVD source, not the master.
     #
     #   aggressive hqdn3d=3:3:6:6, pp=ac, unsharp=3:3:0.6
     #     Stronger denoise and sharpening for heavy noise or composite-captured sources.
@@ -458,7 +460,7 @@ def main(args):
 
     profile_descriptions = {
         "balanced":   "Light spatial denoise, temporal 6:6 for flicker stability, fast deblock, minimal sharpen. "
-                      "Optimised for Hi8/S-Video -> HQ DVD (6.5Mbps).",
+                      "Optimised for Hi8/S-Video capture -> DVD (~4.6Mbps source).",
         "aggressive": "Strong denoise, full deblock+dering, more sharpen. "
                       "Recommended for heavy noise, composite captures, or low-bitrate DVD sources.",
         "halo":       "Heavy denoise, fast deblock, minimal sharpen. "

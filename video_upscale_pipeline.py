@@ -351,17 +351,19 @@ def parse_arguments():
         description="Upscale and interpolate legacy video files (VHS, Hi8, DV camcorder, etc.).",
         epilog="""
 Examples:
-  %(prog)s video.avi                         # 2x upscale, Balanced profile (default)
-  %(prog)s video.avi --scale 4               # 4x upscale, Balanced profile
+  %(prog)s video.avi                          # 2x upscale, balanced profile (default)
+  %(prog)s video.avi --scale 4               # 4x upscale, balanced profile
   %(prog)s video.avi -s 4 --force            # 4x upscale, no cleanup prompt
-  %(prog)s video.avi --legacy-filter         # Original aggressive profile (low-bitrate/composite sources)
-  %(prog)s video.avi --halo-aware            # Halo suppression (white ghost lines around dark edges)
+  %(prog)s video.avi --profile aggressive    # heavy denoise for noisy/composite sources
+  %(prog)s video.avi --profile halo          # halo/ringing suppression
+  %(prog)s video.avi --profile dv            # optimised for MiniDV/Digital8/DV AVI sources
   %(prog)s camcorder.mp4                     # works with DV, Hi8, and other camcorder formats
 
-Pre-filter profiles (mutually exclusive):
-  default          Balanced — Hi8/S-Video -> HQ DVD (6.5Mbps). hqdn3d=2:2:5:5, pp=fd, unsharp=0.2
-  --legacy-filter  Original — low-bitrate or composite-captured sources. hqdn3d=3:3:6:6, pp=ac, unsharp=0.6
-  --halo-aware     Halo fix — white ringing around dark edges. hqdn3d=4:4:8:8, pp=fd, unsharp=0.2
+Pre-filter profiles (--profile):
+  balanced   Default. Hi8/S-Video -> HQ DVD (6.5Mbps).        hqdn3d=2:2:6:6,     pp=fd, unsharp=3:3:0.2
+  aggressive Heavy noise, composite captures, low-bitrate DVD. hqdn3d=3:3:6:6,     pp=ac, unsharp=3:3:0.6
+  halo       White ghost lines / ringing around dark edges.    hqdn3d=4:4:8:8,     pp=fd, unsharp=3:3:0.2
+  dv         MiniDV / Digital8 / DV AVI sources.               hqdn3d=1.5:1.5:4:4, pp=ac, unsharp=3:3:0.25
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -385,19 +387,16 @@ Pre-filter profiles (mutually exclusive):
         help="Force deletion of old processing chunks without prompting."
     )
     parser.add_argument(
-        "--halo-aware", 
-        action="store_true", 
-        help="Suppress ringing/halo artifacts: increases denoising and minimises sharpening. "
-             "Use only if you see white ghost lines around dark edges in the output. "
-             "Mutually exclusive with --legacy-filter."
-    )
-    parser.add_argument(
-        "--legacy-filter",
-        action="store_true",
-        help="Use the original aggressive pre-filter profile (hqdn3d=3:3:6:6, pp=ac, unsharp=0.6). "
-             "Intended for heavily compressed or composite-captured sources (low-bitrate DVD, VHS via composite). "
-             "The default Balanced profile is recommended for Hi8/S-Video -> HQ DVD (6.5Mbps) sources. "
-             "Mutually exclusive with --halo-aware."
+        "--profile",
+        choices=["balanced", "aggressive", "halo", "dv"],
+        default="balanced",
+        help=(
+            "Pre-filter profile (default: balanced). "
+            "balanced:   Hi8/S-Video -> HQ DVD. Light denoise, temporal 6:6 stability, fast deblock, minimal sharpen. "
+            "aggressive: Heavy noise, composite captures, or low-bitrate DVD. Stronger denoise, full deblock+dering, more sharpen. "
+            "halo:       White ghost lines around dark edges. Heavy denoise, fast deblock, minimal sharpen. "
+            "dv:         MiniDV/Digital8/DV AVI. Lighter denoise, stronger deblock+dering, gentle sharpen."
+        )
     )
     parser.add_argument(
         "--max-runtime",
@@ -424,41 +423,50 @@ def main(args):
     INPUT_EXT = os.path.splitext(INPUT_VIDEO)[1]
     
     # --- Pre-filter Profile Selection ---
-    # Three mutually exclusive profiles selected by command-line flags.
-    # Default (no flags): Balanced — tuned for Hi8/S-Video -> HQ DVD (6.5Mbps) sources.
+    # Selected via --profile. Default: balanced.
+    # Filter chains are defined in PROFILES; adding a new profile is a one-line change.
     #
-    # Profile comparison:
-    #   Balanced (default) hqdn3d=2:2:5:5, pp=fd, unsharp=0.2
-    #     Light spatial denoise preserves texture for ESRGAN. Moderate temporal
-    #     smoothing provides frame consistency for RIFE without blurring motion.
-    #     pp=fd handles DVD macroblocking without the 'waxy' over-smoothing of pp=ac.
-    #     Minimal sharpening avoids introducing pre-upscale halos.
+    #   balanced   hqdn3d=2:2:6:6, pp=fd, unsharp=3:3:0.2
+    #     Light spatial denoise preserves texture for ESRGAN. Temporal at 6:6 stabilises
+    #     frame-to-frame flicker without touching real detail. pp=fd handles DVD
+    #     macroblocking. Minimal sharpening avoids pre-upscale halos.
+    #     Tuned for Hi8/S-Video -> HQ DVD (6.5Mbps) sources.
     #
-    #   Halo-Aware        hqdn3d=4:4:8:8, pp=fd, unsharp=0.2
-    #     Heavier denoise suppresses the source ringing that ESRGAN would otherwise
-    #     amplify. Use only if you see white ghost lines around dark edges in output.
+    #   aggressive hqdn3d=3:3:6:6, pp=ac, unsharp=3:3:0.6
+    #     Stronger denoise and sharpening for heavy noise or composite-captured sources.
+    #     pp=ac full deblock+dering suited to low-bitrate DVD or VHS via composite.
     #
-    #   Legacy            hqdn3d=3:3:6:6, pp=ac, unsharp=0.6
-    #     Original aggressive profile. Suited to low-bitrate or composite-captured
-    #     sources (e.g. heavily compressed DVD, VHS via composite connection) where
-    #     stronger deblocking and denoising are warranted. pp=ac full deblock+dering.
+    #   halo       hqdn3d=4:4:8:8, pp=fd, unsharp=3:3:0.2
+    #     Heavy denoise suppresses source ringing that ESRGAN would otherwise amplify.
+    #     Use only if you see white ghost lines around dark edges in output.
+    #
+    #   dv         hqdn3d=1.5:1.5:4:4, pp=ac, unsharp=3:3:0.25
+    #     DV compression produces DCT block noise and mosquito ringing rather than
+    #     analog grain. Lighter spatial denoise preserves genuine DV detail; pp=ac
+    #     targets block/ringing artifacts; moderate temporal smoothing handles
+    #     low-light flicker without over-filtering clean digital footage.
 
-    if args.halo_aware and args.legacy_filter:
-        print("ERROR: --halo-aware and --legacy-filter are mutually exclusive. Pick one.")
-        sys.exit(1)
+    PROFILES = {
+        "balanced":   "hqdn3d=2:2:6:6,pp=fd,unsharp=3:3:0.2",
+        "aggressive": "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
+        "halo":       "hqdn3d=4:4:8:8,pp=fd,unsharp=3:3:0.2",
+        "dv":         "hqdn3d=1.5:1.5:4:4,pp=ac,unsharp=3:3:0.25",
+    }
 
-    if args.halo_aware:
-        prefilter_vf = "hqdn3d=4:4:8:8,pp=fd,unsharp=3:3:0.2"
-        print("   [Mode] Halo-Aware: Heavy denoise, fast deblock, minimal sharpen. "
-              "Use if you see white ghost lines around dark edges.")
-    elif args.legacy_filter:
-        prefilter_vf = "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6"
-        print("   [Mode] Legacy: Original aggressive profile (hqdn3d=3:3:6:6, pp=ac, unsharp=0.6). "
-              "Recommended for low-bitrate DVD or composite-captured sources.")
-    else:
-        prefilter_vf = "hqdn3d=2:2:5:5,pp=fd,unsharp=3:3:0.2"
-        print("   [Mode] Balanced (default): Optimised for Hi8/S-Video -> HQ DVD (6.5Mbps). "
-              "Light spatial denoise, moderate temporal stability, fast deblock, minimal sharpen.")
+    profile = args.profile
+    prefilter_vf = PROFILES[profile]
+
+    profile_descriptions = {
+        "balanced":   "Light spatial denoise, temporal 6:6 for flicker stability, fast deblock, minimal sharpen. "
+                      "Optimised for Hi8/S-Video -> HQ DVD (6.5Mbps).",
+        "aggressive": "Strong denoise, full deblock+dering, more sharpen. "
+                      "Recommended for heavy noise, composite captures, or low-bitrate DVD sources.",
+        "halo":       "Heavy denoise, fast deblock, minimal sharpen. "
+                      "Use if you see white ghost lines around dark edges.",
+        "dv":         "Light spatial denoise, moderate temporal smoothing, full deblock+dering, gentle sharpen. "
+                      "Optimised for MiniDV / Digital8 / DV AVI sources.",
+    }
+    print(f"   [Profile] {profile}: {profile_descriptions[profile]}")
 
     # Calculate FFmpeg thread count
     if args.threads and args.threads > 0:
@@ -492,7 +500,8 @@ def main(args):
     metadata_file = os.path.join(PROCESSING_DIR, "metadata.json")
     current_metadata = {
         "input_video": os.path.abspath(INPUT_VIDEO),
-        "scale_factor": SCALE_FACTOR
+        "scale_factor": SCALE_FACTOR,
+        "profile": profile,
     }
     
     if os.path.exists(metadata_file):
@@ -520,7 +529,7 @@ def main(args):
             print(f"WARNING: Could not read metadata file. Deleting processing_chunks. Error: {e}")
             safe_rmtree(PROCESSING_DIR)
     
-    # Save current metadata
+    # Save current metadata (includes input_video, scale_factor, profile)
     os.makedirs(PROCESSING_DIR, exist_ok=True)
     with open(metadata_file, 'w') as f:
         json.dump(current_metadata, f, indent=4)

@@ -523,29 +523,61 @@ def main(args):
     }
     
     if os.path.exists(metadata_file):
+        # Attempt to read and parse the metadata file.
+        # Any failure (corrupt JSON, permission error, etc.) is treated as an
+        # unknown state — we NEVER delete chunks silently. The user must confirm
+        # or pass --force explicitly after being shown the error.
+        old_metadata = None
+        metadata_read_error = None
         try:
             with open(metadata_file, 'r') as f:
                 old_metadata = json.load(f)
-            
-            if old_metadata != current_metadata:
-                print(f"\n⚠️  WARNING: processing_chunks contains data from a different job:")
-                print(f"  Old: {old_metadata}")
-                print(f"  New: {current_metadata}")
-                
-                if args.force:
-                    print("Deleting old chunks... (--force specified)")
+        except json.JSONDecodeError as e:
+            metadata_read_error = f"metadata.json is corrupt or contains invalid JSON: {e}"
+        except Exception as e:
+            metadata_read_error = f"Could not read metadata.json: {e}"
+
+        if metadata_read_error:
+            # Metadata is unreadable — could mean a partial write during a
+            # previous crash. Completed chunk files may still be valid and
+            # resumable. Never auto-delete; always ask.
+            print(f"\n⚠️  WARNING: {metadata_read_error}")
+            print(f"    Metadata file: {metadata_file}")
+            print(f"    Processing chunks directory: {PROCESSING_DIR}")
+            print(f"    There may be completed chunks worth preserving.")
+            if args.force:
+                print("Deleting processing_chunks... (--force specified)")
+                safe_rmtree(PROCESSING_DIR)
+            else:
+                print("\nOptions:")
+                print("  y = delete processing_chunks and start fresh")
+                print("  n = exit so you can inspect the chunks manually")
+                response = input("Delete processing_chunks and start fresh? (y/n): ")
+                if response.lower() == 'y':
+                    print("Deleting processing_chunks...")
                     safe_rmtree(PROCESSING_DIR)
                 else:
-                    response = input("Delete old chunks and start fresh? (y/n): ")
-                    if response.lower() == 'y':
-                        print("Deleting old chunks...")
-                        safe_rmtree(PROCESSING_DIR)
-                    else:
-                        print("Exiting to avoid mixing chunks from different videos.")
-                        sys.exit(1)
-        except Exception as e:
-            print(f"WARNING: Could not read metadata file. Deleting processing_chunks. Error: {e}")
-            safe_rmtree(PROCESSING_DIR)
+                    print("Exiting. Inspect or repair metadata.json before restarting.")
+                    print(f"  To repair: python3 -c \"import json; print(open(\'{metadata_file}\').read())\"")
+                    print(f"  To reset:  rm -rf {PROCESSING_DIR}")
+                    sys.exit(1)
+
+        elif old_metadata != current_metadata:
+            print(f"\n⚠️  WARNING: processing_chunks contains data from a different job:")
+            print(f"  Old: {old_metadata}")
+            print(f"  New: {current_metadata}")
+
+            if args.force:
+                print("Deleting old chunks... (--force specified)")
+                safe_rmtree(PROCESSING_DIR)
+            else:
+                response = input("Delete old chunks and start fresh? (y/n): ")
+                if response.lower() == 'y':
+                    print("Deleting old chunks...")
+                    safe_rmtree(PROCESSING_DIR)
+                else:
+                    print("Exiting to avoid mixing chunks from different videos.")
+                    sys.exit(1)
     
     # Save current metadata (includes input_video, scale_factor, profile)
     os.makedirs(PROCESSING_DIR, exist_ok=True)

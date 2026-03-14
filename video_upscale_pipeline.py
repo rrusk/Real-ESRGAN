@@ -357,6 +357,7 @@ Examples:
   %(prog)s video.avi --profile aggressive    # heavy denoise for noisy/composite sources
   %(prog)s video.avi --profile halo          # halo/ringing suppression
   %(prog)s video.avi --profile dv            # optimised for MiniDV/Digital8/DV AVI sources
+  %(prog)s video.avi --profile hi8dv         # Hi8 tape via Digital8/FireWire direct capture
   %(prog)s camcorder.mp4                     # works with DV, Hi8, and other camcorder formats
 
 Pre-filter profiles (--profile):
@@ -364,6 +365,7 @@ Pre-filter profiles (--profile):
   aggressive Heavy noise, composite captures, low-bitrate DVD. hqdn3d=3:3:6:6,     pp=ac, unsharp=3:3:0.6
   halo       White ghost lines / ringing around dark edges.    hqdn3d=4:4:8:8,     pp=fd, unsharp=3:3:0.2
   dv         MiniDV / Digital8 / DV AVI sources.               hqdn3d=1.5:1.5:4:4, pp=ac, unsharp=3:3:0.25
+  hi8dv      Hi8 tape via Digital8/FireWire direct capture.     hqdn3d=2:2:5:5,     pp=ac, unsharp=3:3:0.2
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -388,14 +390,15 @@ Pre-filter profiles (--profile):
     )
     parser.add_argument(
         "--profile",
-        choices=["balanced", "aggressive", "halo", "dv"],
+        choices=["balanced", "aggressive", "halo", "dv", "hi8dv"],
         default="balanced",
         help=(
             "Pre-filter profile (default: balanced). "
             "balanced:   Hi8/S-Video capture -> DVD (~4.6Mbps source). Light denoise, temporal 6:6 stability, fast deblock, minimal sharpen. "
             "aggressive: Heavy noise, composite captures, or low-bitrate DVD. Stronger denoise, full deblock+dering, more sharpen. "
             "halo:       White ghost lines around dark edges. Heavy denoise, fast deblock, minimal sharpen. "
-            "dv:         MiniDV/Digital8/DV AVI. Lighter denoise, stronger deblock+dering, gentle sharpen."
+            "dv:         MiniDV/Digital8/DV AVI. Lighter denoise, stronger deblock+dering, gentle sharpen. "
+            "hi8dv:      Hi8 tape via Digital8/FireWire (DV capture). No MPEG-2 artifacts; moderate temporal denoise, full deblock+dering."
         )
     )
     parser.add_argument(
@@ -447,12 +450,23 @@ def main(args):
     #     analog grain. Lighter spatial denoise preserves genuine DV detail; pp=ac
     #     targets block/ringing artifacts; moderate temporal smoothing handles
     #     low-light flicker without over-filtering clean digital footage.
+    #
+    #   hi8dv      hqdn3d=2:2:5:5, pp=ac, unsharp=3:3:0.2
+    #     For Hi8 tapes transferred via a Digital8 camcorder (e.g. DCR-TRV350)
+    #     over FireWire as a DV stream. No MPEG-2 blocking or ringing — those
+    #     artifacts are absent because the DVD authoring step is bypassed.
+    #     Temporal at 5:5 (lighter than balanced) since MPEG-2 compression
+    #     flicker is gone; only genuine Hi8 tape noise remains. pp=ac targets
+    #     the light DCT blocking introduced by the DV codec itself. Light
+    #     spatial denoise and minimal sharpen preserve analog tape character
+    #     for ESRGAN to work with.
 
     PROFILES = {
         "balanced":   "hqdn3d=2:2:6:6,pp=fd,unsharp=3:3:0.2",
         "aggressive": "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
         "halo":       "hqdn3d=4:4:8:8,pp=fd,unsharp=3:3:0.2",
         "dv":         "hqdn3d=1.5:1.5:4:4,pp=ac,unsharp=3:3:0.25",
+        "hi8dv":      "hqdn3d=2:2:5:5,pp=ac,unsharp=3:3:0.2",
     }
 
     profile = args.profile
@@ -467,6 +481,8 @@ def main(args):
                       "Use if you see white ghost lines around dark edges.",
         "dv":         "Light spatial denoise, moderate temporal smoothing, full deblock+dering, gentle sharpen. "
                       "Optimised for MiniDV / Digital8 / DV AVI sources.",
+        "hi8dv":      "Light spatial denoise, temporal 5:5 (no MPEG-2 flicker to suppress), full deblock+dering, minimal sharpen. "
+                      "Optimised for Hi8 tape via Digital8/FireWire direct DV capture.",
     }
     print(f"   [Profile] {profile}: {profile_descriptions[profile]}")
 

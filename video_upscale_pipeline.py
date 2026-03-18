@@ -712,6 +712,11 @@ def main(args):
         rife_out_frames_dir = os.path.join(RIFE_CHUNKS_DIR, f"{chunk_name}_rife_out_frames")
         rife_output_file = os.path.join(RIFE_CHUNKS_DIR, f"{chunk_name}_rife.mp4")
 
+        # Track which steps were skipped so partial-resume chunks are excluded
+        # from the median ETA — they represent far less work than a full chunk.
+        skipped_esrgan = False
+        skipped_frame_extraction = False
+
         if os.path.exists(rife_output_file) and os.path.getsize(rife_output_file) > 0:
             if is_valid_video(rife_output_file):
                 print(f"  > Chunk already processed. Skipping.")
@@ -790,12 +795,14 @@ def main(args):
             safe_rmtree(esrgan_temp_work_dir)
             print(f"  > Real-ESRGAN complete: {esrgan_output_file}")
         else:
+            skipped_esrgan = True
             print(f"  > Found existing Real-ESRGAN output, skipping to RIFE.")
 
         # --- Step 2: Run RIFE (Multi-Step) ---
         # Check if RIFE input frames already exist and are complete
         existing_in_frames = glob.glob(os.path.join(rife_in_frames_dir, "*.png")) if os.path.isdir(rife_in_frames_dir) else []
         if existing_in_frames:
+            skipped_frame_extraction = True
             print(f"  > Found {len(existing_in_frames)} existing RIFE input frames, skipping extraction.")
         else:
             print(f"  > Extracting frames for RIFE...")
@@ -804,9 +811,25 @@ def main(args):
                 "ffmpeg", "-i", esrgan_output_file,
                 os.path.join(rife_in_frames_dir, "frame_%08d.png")
             ]
+            # Timeout: allow 10s per expected frame plus a 120s fixed overhead.
+            # Normal extraction takes 20-45s. This catches silent hangs (e.g. a
+            # subprocess pipe buffer deadlock with capture_output=True) that would
+            # otherwise block the pipeline indefinitely without any error output.
+            # capture_output=True is intentionally kept to preserve error messages
+            # on genuine failures; the timeout is the safeguard against deadlock.
+            expected_frames = int(source_fps_float * CHUNK_DURATION_SECONDS)
+            extraction_timeout = 120 + (expected_frames * 10)
             try:
                 with Timer(f"{chunk_name} RIFE Frame Extraction"):
-                    subprocess.run(cmd_extract, check=True, capture_output=True, text=True)
+                    subprocess.run(cmd_extract, check=True, capture_output=True,
+                                   text=True, timeout=extraction_timeout)
+            except subprocess.TimeoutExpired:
+                print(f"\n--- ERROR: FFmpeg frame extraction timed out on {chunk_name} ---")
+                print(f"    Timeout: {extraction_timeout}s "
+                      f"(expected ~{expected_frames} frames at {source_fps_float:.3f} fps)")
+                print(f"    Partial frames in {rife_in_frames_dir} will be wiped on next run.")
+                print(f"    If this recurs, check disk I/O and available space.")
+                raise RuntimeError(f"Frame extraction timed out after {extraction_timeout}s on {chunk_name}")
             except subprocess.CalledProcessError as e:
                 print(f"\n--- ERROR: FFmpeg frame extraction failed on {chunk_name} ---")
                 print("STDOUT:", e.stdout)
@@ -881,10 +904,25 @@ def main(args):
         chunk_end_time = time.time()
         duration_sec = chunk_end_time - chunk_start_time
         local_end = datetime.now().astimezone()
-        chunk_durations.append(duration_sec)
+
+        # Only include full chunk timings in the median. Partial-resume chunks
+        # (where ESRGAN or frame extraction was skipped) represent far less work
+        # and would skew the ETA estimate significantly downward.
+        is_full_chunk = not skipped_esrgan and not skipped_frame_extraction
+        if is_full_chunk:
+            chunk_durations.append(duration_sec)
+        else:
+            skipped_steps = []
+            if skipped_esrgan: skipped_steps.append("ESRGAN")
+            if skipped_frame_extraction: skipped_steps.append("frame extraction")
+            print(f"  > Partial resume (skipped: {', '.join(skipped_steps)}) — "
+                  f"chunk time excluded from median ETA.")
 
         # Rolling median ETA (stable across noisy chunks)
-        median_sec = statistics.median(chunk_durations)
+        if chunk_durations:
+            median_sec = statistics.median(chunk_durations)
+        else:
+            median_sec = duration_sec  # fallback if no full chunks yet
         chunks_remaining = total_chunks - (i + 1)
         eta_project = local_end + timedelta(seconds=median_sec * chunks_remaining)
 

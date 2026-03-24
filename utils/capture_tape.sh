@@ -10,9 +10,46 @@
 # Do NOT use relative paths (./captures) as dvgrab will fail to create files.
 # Override at runtime with: -o /path/to/output
 # ==============================================================================
+#
+# NOTE: The entire script body is wrapped in main() and called at the bottom.
+# This causes bash to read and parse the complete script into memory before
+# execution begins, so editing this file mid-run has no effect on the current
+# capture session.
+# ==============================================================================
 set -uo pipefail
 
+# ==============================================================================
+# Dependency Preflight
+# Fail early with a clear message rather than a cryptic error mid-capture.
+# Placed outside main() so it runs before the function body is even entered.
+# ==============================================================================
+for cmd in dvgrab ffprobe bc gawk; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+        echo "[ERROR] Required command not found: $cmd"
+        echo "        Install it and retry."
+        exit 1
+    }
+done
+
+# ==============================================================================
+# Configuration
+# Placed outside main() so they are visible to usage() help text at any point.
+# ==============================================================================
 CAPTURE_ROOT="/mnt/video_capture/avi/captures"
+
+# How often to emit a progress line to the console and log during capture.
+# This is used to bracket damaged-frame warnings with an approximate tape
+# position, since Hi8 timecodes are garbage and cannot be used directly.
+# Value is in seconds. At 29.97fps NTSC: 60s = ~1798 frames.
+# Increase to reduce log verbosity; decrease for finer position resolution.
+PROGRESS_INTERVAL_SEC=60
+
+# ==============================================================================
+# main() — entire script body
+# bash reads and parses this function completely before executing it, so any
+# edits made to this file after the script starts are safely ignored.
+# ==============================================================================
+main() {
 
 # ==============================================================================
 # Usage / Help
@@ -44,7 +81,7 @@ usage() {
     echo "  - Spaces are converted to underscores automatically."
     echo "  - Special characters are stripped for filesystem safety."
     echo "  - Capture date is appended so repeat captures don't overwrite each other."
-    echo "  - Output files are placed in CAPTURE_ROOT/<name>/ with a matching log."
+    echo "  - Output files are placed in CAPTURE_ROOT/<n>/ with a matching log."
     echo "  - For Digital8 tapes, the original filming date is preserved inside"
     echo "    the DV stream and can be extracted later with dvgrab or ffprobe."
     echo "  - After capture, all unique recording dates found on the tape are"
@@ -103,7 +140,8 @@ if [ ! -d "$CAPTURE_ROOT" ]; then
 fi
 if [ ! -w "$CAPTURE_ROOT" ]; then
     echo "[ERROR] CAPTURE_ROOT is not writable: $CAPTURE_ROOT"
-    echo "        Check permissions with: ls -la $(dirname $CAPTURE_ROOT)"
+    _parent=$(dirname "$CAPTURE_ROOT")
+    echo "        Check permissions with: ls -la \"$_parent\""
     exit 1
 fi
 
@@ -134,7 +172,9 @@ DATE_REPORT="${OUTPUT_DIR}/${BASE_NAME}.dates.txt"
 # SESSION_DATE makes this unlikely, but protects against same-minute re-runs
 # ==============================================================================
 mkdir -p "$OUTPUT_DIR"
-if [ -n "$(ls -A "$OUTPUT_DIR" 2>/dev/null)" ]; then
+# find is more reliable than ls -A for non-empty check — handles odd filenames
+# and avoids word-splitting on the subshell output.
+if [ "$(find "$OUTPUT_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
     echo "[WARNING] Output directory is not empty: $OUTPUT_DIR"
     echo "          A previous capture may exist. Continuing will mix files."
     read -p "Continue anyway? (y/n): " CONTINUE
@@ -178,6 +218,11 @@ FLAGS=(
     --size 0         # Single large file; no size-based splitting
     --autosplit      # Split ONLY on signal loss or timecode jumps
     --opendml        # Support files >4GB (essential for 120min tapes)
+    --showstatus     # Emit continuous progress lines; filtered below to one
+                     # per PROGRESS_INTERVAL_SEC so damaged-frame warnings
+                     # can be bracketed by approximate tape position.
+                     # Without this, dvgrab only prints a status line at the
+                     # very end of capture (when --size 0 closes the file).
     # --noavc        # Uncomment if camera mechanical control hangs
 )
 
@@ -191,9 +236,57 @@ echo "---------------------------------------------------------"
 # ==============================================================================
 # 7. Execution & Logging
 # ==============================================================================
+# PROGRESS_INTERVAL_SEC converted to a frame count at NTSC 29.97fps.
+# Integer arithmetic using exact NTSC ratio 1001/30000.
+PROGRESS_FRAMES=$(( PROGRESS_INTERVAL_SEC * 2997 / 100 ))
+
+# dvgrab --showstatus emits a status line for every frame update. The awk
+# filter below passes through important lines immediately (damage warnings,
+# start/stop markers, autosplit notices, the final summary) and samples
+# progress lines at PROGRESS_FRAMES intervals so the console stays readable
+# and the log stays manageable. Each sampled progress line is prefixed with
+# an approximate tape position derived from the frame count, giving useful
+# brackets around any damaged-frame warnings.
+#
 # || true ensures the script continues to the Audit even if dvgrab
-# exits non-zero (normal on tape end)
-dvgrab "${FLAGS[@]}" "$OUTPUT_DIR/${BASE_NAME}" 2>&1 | tee "$LOG_FILE" || true
+# exits non-zero (normal on tape end).
+dvgrab "${FLAGS[@]}" "$OUTPUT_DIR/${BASE_NAME}" 2>&1 \
+| awk -v interval="$PROGRESS_FRAMES" '
+    # Always pass through: damage warnings and their explanation line,
+    # capture lifecycle messages, autosplit notices, final summary warnings.
+    /damaged frame|missing or invalid|Capture Start|Capture Stop|Warning:|Autosplit/ {
+        print; fflush(); next
+    }
+
+    # Progress lines contain " frames " — sample every N frames and annotate
+    # with an approximate h:mm:ss position for easy scrubbing in the AVI.
+    / frames / {
+        # match() is more robust than field-walking; immune to column
+        # shifts from localization or dvgrab version differences.
+        # else { next } guards against reusing a stale frame_count if
+        # match() fails on an unexpected line format.
+        if (match($0, /([0-9]+) frames/, m)) {
+            frame_count = m[1]
+        } else {
+            next
+        }
+        if (frame_count - last_printed >= interval || last_printed == 0) {
+            # Use exact NTSC ratio 1001/30000 in both shell and awk to
+            # avoid drift between integer and float math over a 2-hour tape.
+            total_sec = int(frame_count * 1001 / 30000)
+            h   = int(total_sec / 3600)
+            m_  = int((total_sec % 3600) / 60)
+            s   = total_sec % 60
+            printf "[PROGRESS ~%d:%02d:%02d] %s\n", h, m_, s, $0
+            fflush()
+            last_printed = frame_count
+        }
+        next
+    }
+
+    # Pass through everything else (device init messages, blank lines, etc.)
+    { print; fflush() }
+' | tee "$LOG_FILE" || true
 
 # ==============================================================================
 # 8. Post-Capture Integrity Audit
@@ -202,7 +295,21 @@ printf '\a'
 echo "---------------------------------------------------------"
 echo "RUNNING DATA INTEGRITY AUDIT..."
 
-LATEST_FILE=$(ls -t "$OUTPUT_DIR"/*.avi 2>/dev/null | head -1)
+# nullglob prevents the glob literal being passed as a filename if no .avi
+# files exist. The array then reliably holds zero or more actual paths.
+shopt -s nullglob
+AVI_FILES=("$OUTPUT_DIR"/*.avi)
+shopt -u nullglob
+
+if [ "${#AVI_FILES[@]}" -eq 0 ]; then
+    echo "[ERROR] No AVI file was generated. Check $LOG_FILE" | tee -a "$LOG_FILE"
+    exit 1
+fi
+
+# ls -t sorts by modification time — correct for autosplit edge cases where
+# lexicographic sort would mis-order file9.avi vs file10.avi.
+# Using the array as explicit arguments (not a glob) is a safe use of ls.
+LATEST_FILE=$(ls -t -- "${AVI_FILES[@]}" | head -1)
 
 if [ -f "$LATEST_FILE" ]; then
 
@@ -261,9 +368,6 @@ if [ -f "$LATEST_FILE" ]; then
             echo "---------------------------------------------------------"
         } | tee -a "$LOG_FILE"
     fi
-else
-    echo "[ERROR] No AVI file was generated. Check $LOG_FILE" | tee -a "$LOG_FILE"
-    exit 1
 fi
 
 # ==============================================================================
@@ -278,8 +382,10 @@ echo "---------------------------------------------------------"
 echo "ANALYSING RECORDING DATES..."
 
 if [ -f "$LOG_FILE" ]; then
-    # Extract all dates in YYYY.MM.DD format, filter to sane year range
-    VALID_DATES=$(grep -oP 'date \K\d{4}\.\d{2}\.\d{2}' "$LOG_FILE" \
+    # Extract all dates in YYYY.MM.DD format, filter to sane year range.
+    # grep -oE is portable (no PCRE required); cut trims the "date " prefix.
+    VALID_DATES=$(grep -oE 'date [0-9]{4}\.[0-9]{2}\.[0-9]{2}' "$LOG_FILE" \
+        | cut -d' ' -f2 \
         | awk -F. '$1 >= 1980 && $1 <= 2010' \
         | sort -u)
 
@@ -287,9 +393,11 @@ if [ -f "$LOG_FILE" ]; then
         DATE_COUNT=$(echo "$VALID_DATES" | wc -l)
 
         # First and last valid full timestamps
-        FIRST_STAMP=$(grep -oP 'date \K\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}' "$LOG_FILE" \
+        FIRST_STAMP=$(grep -oE 'date [0-9]{4}\.[0-9]{2}\.[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$LOG_FILE" \
+            | cut -d' ' -f2-3 \
             | awk -F'[. ]' '$1 >= 1980 && $1 <= 2010' | head -1)
-        LAST_STAMP=$(grep -oP 'date \K\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}' "$LOG_FILE" \
+        LAST_STAMP=$(grep -oE 'date [0-9]{4}\.[0-9]{2}\.[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$LOG_FILE" \
+            | cut -d' ' -f2-3 \
             | awk -F'[. ]' '$1 >= 1980 && $1 <= 2010' | tail -1)
 
         # Build the report — write to both terminal and date report file
@@ -326,3 +434,7 @@ echo "Log:         $LOG_FILE"
 if [ -f "$DATE_REPORT" ]; then
     echo "Date report: $DATE_REPORT"
 fi
+
+} # end main()
+
+main "$@"

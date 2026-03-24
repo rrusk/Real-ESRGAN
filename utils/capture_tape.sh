@@ -1,0 +1,328 @@
+#!/bin/bash
+# ==============================================================================
+# Script Name: capture_tape.sh v18 - Final Production Archival Ingest
+# Optimized for: Sony DCR-TRV330 (Hi8/Digital8) & LSI FireWire Chipsets
+# ==============================================================================
+# CONFIGURATION REQUIRED:
+# Set CAPTURE_ROOT to the absolute path where captured files will be stored.
+# This directory must exist and be writable before running this script.
+# Example: /mnt/video_capture/avi/captures
+# Do NOT use relative paths (./captures) as dvgrab will fail to create files.
+# Override at runtime with: -o /path/to/output
+# ==============================================================================
+set -uo pipefail
+
+CAPTURE_ROOT="/mnt/video_capture/avi/captures"
+
+# ==============================================================================
+# Usage / Help
+# ==============================================================================
+usage() {
+    echo ""
+    echo "Usage: $0 [-o OUTPUT_DIR] <TAPE_ID> [DESCRIPTION]"
+    echo ""
+    echo "  -o OUTPUT_DIR  Optional. Override the default capture root."
+    echo "                 Default: ${CAPTURE_ROOT}"
+    echo "  TAPE_ID        Required. A short unique identifier for the tape."
+    echo "                 Spaces are allowed and will be converted to underscores."
+    echo "  DESCRIPTION    Optional. Additional context appended to the filename."
+    echo ""
+    echo "Examples:"
+    echo "  $0 TAPE01"
+    echo "     -> ${CAPTURE_ROOT}/TAPE01_20250319_1430/TAPE01_20250319_1430001.avi"
+    echo ""
+    echo "  $0 '1995 Summer Vacation'"
+    echo "     -> ${CAPTURE_ROOT}/1995_Summer_Vacation_20250319_1430/1995_Summer_Vacation_20250319_1430001.avi"
+    echo ""
+    echo "  $0 BOX2_TAPE04 'Christmas 1998'"
+    echo "     -> ${CAPTURE_ROOT}/BOX2_TAPE04_Christmas_1998_20250319_1430/BOX2_TAPE04_Christmas_1998_20250319_1430001.avi"
+    echo ""
+    echo "  $0 -o /tmp/test TAPE01 'Summer 1995'"
+    echo "     -> /tmp/test/TAPE01_Summer_1995_20250319_1430/TAPE01_Summer_1995_20250319_1430001.avi"
+    echo ""
+    echo "Notes:"
+    echo "  - Spaces are converted to underscores automatically."
+    echo "  - Special characters are stripped for filesystem safety."
+    echo "  - Capture date is appended so repeat captures don't overwrite each other."
+    echo "  - Output files are placed in CAPTURE_ROOT/<name>/ with a matching log."
+    echo "  - For Digital8 tapes, the original filming date is preserved inside"
+    echo "    the DV stream and can be extracted later with dvgrab or ffprobe."
+    echo "  - After capture, all unique recording dates found on the tape are"
+    echo "    reported. Garbage timecodes outside 1980-2010 are filtered out."
+    echo ""
+    echo "IMPORTANT: Default CAPTURE_ROOT is hardcoded in this script as:"
+    echo "  ${CAPTURE_ROOT}"
+    echo "  Edit the CAPTURE_ROOT variable at the top of the script to change it."
+    echo ""
+}
+
+if [ "$#" -lt 1 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    usage
+    [ "$#" -lt 1 ] && exit 1 || exit 0
+fi
+
+# ==============================================================================
+# 1. Argument Parsing
+# ==============================================================================
+while getopts ":o:" opt; do
+    case $opt in
+        o)
+            CAPTURE_ROOT="$OPTARG"
+            ;;
+        \?)
+            echo "[ERROR] Unknown option: -$OPTARG"
+            usage
+            exit 1
+            ;;
+        :)
+            echo "[ERROR] Option -$OPTARG requires an argument."
+            usage
+            exit 1
+            ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [ "$#" -lt 1 ]; then
+    echo "[ERROR] TAPE_ID is required."
+    usage
+    exit 1
+fi
+
+TAPE_ID="$1"
+EXTRA_DESC="${2:-}"
+
+# ==============================================================================
+# 2. Validate CAPTURE_ROOT
+# ==============================================================================
+if [ ! -d "$CAPTURE_ROOT" ]; then
+    echo "[ERROR] CAPTURE_ROOT does not exist: $CAPTURE_ROOT"
+    echo "        Create it with: mkdir -p $CAPTURE_ROOT"
+    echo "        Or specify a different path with: -o /path/to/output"
+    exit 1
+fi
+if [ ! -w "$CAPTURE_ROOT" ]; then
+    echo "[ERROR] CAPTURE_ROOT is not writable: $CAPTURE_ROOT"
+    echo "        Check permissions with: ls -la $(dirname $CAPTURE_ROOT)"
+    exit 1
+fi
+
+# ==============================================================================
+# 3. Configuration & Sanitization
+# ==============================================================================
+# Sanitize: printf avoids the trailing newline that echo appends, which tr
+# was converting to a trailing underscore and causing double-underscore filenames.
+SAFE_ID=$(printf '%s' "$TAPE_ID" | tr '[:space:]' '_' | tr -cd '[:alnum:]_-')
+SAFE_DESC=$(printf '%s' "$EXTRA_DESC" | tr '[:space:]' '_' | tr -cd '[:alnum:]_-')
+
+# Capture date disambiguates repeat captures of the same tape (e.g. after a head clog)
+SESSION_DATE=$(date +%Y%m%d_%H%M)
+
+# Build BASE_NAME, only including SAFE_DESC if it is non-empty
+if [[ -n "$SAFE_DESC" ]]; then
+    BASE_NAME="${SAFE_ID}_${SAFE_DESC}_${SESSION_DATE}"
+else
+    BASE_NAME="${SAFE_ID}_${SESSION_DATE}"
+fi
+
+OUTPUT_DIR="${CAPTURE_ROOT}/${BASE_NAME}"
+LOG_FILE="${OUTPUT_DIR}/${BASE_NAME}.log"
+DATE_REPORT="${OUTPUT_DIR}/${BASE_NAME}.dates.txt"
+
+# ==============================================================================
+# 4. Pre-flight: Directory Collision Check
+# SESSION_DATE makes this unlikely, but protects against same-minute re-runs
+# ==============================================================================
+mkdir -p "$OUTPUT_DIR"
+if [ -n "$(ls -A "$OUTPUT_DIR" 2>/dev/null)" ]; then
+    echo "[WARNING] Output directory is not empty: $OUTPUT_DIR"
+    echo "          A previous capture may exist. Continuing will mix files."
+    read -p "Continue anyway? (y/n): " CONTINUE
+    if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+        echo "Aborted. Remove or rename $OUTPUT_DIR and retry."
+        exit 2
+    fi
+fi
+
+# ==============================================================================
+# 5. Hardware Pre-Check
+# ==============================================================================
+if ! ls /dev/fw* &>/dev/null && ! ls /dev/raw1394 &>/dev/null; then
+    echo "[ERROR] FireWire device node not found. Is the Sony TRV330 in VTR mode?"
+    exit 1
+fi
+
+echo "========================================================="
+echo "ARCHIVAL INGEST: $BASE_NAME"
+echo "Output:  $OUTPUT_DIR"
+echo "---------------------------------------------------------"
+echo "CHECKLIST:"
+echo " - Tape rewound to start point?"
+echo " - Destination drive has ~35GB free?"
+echo "---------------------------------------------------------"
+read -p "Begin automated playback and capture? (y/n): " PROCEED
+if [[ ! "$PROCEED" =~ ^[Yy]$ ]]; then
+    echo "Capture aborted by user."
+    exit 2
+fi
+
+# ==============================================================================
+# 6. Flag Configuration (Bash Array)
+# ==============================================================================
+# Note: --timestamp intentionally omitted. SESSION_DATE in BASE_NAME records
+# the capture date instead. For analog Hi8 (1993-2003) there is no internal
+# tape date anyway. For Digital8, the original filming date is preserved
+# inside the DV stream and can be extracted later with dvgrab or ffprobe.
+FLAGS=(
+    --format dv2     # Type 2 AVI (Standard for FFmpeg/AI pipeline)
+    --size 0         # Single large file; no size-based splitting
+    --autosplit      # Split ONLY on signal loss or timecode jumps
+    --opendml        # Support files >4GB (essential for 120min tapes)
+    # --noavc        # Uncomment if camera mechanical control hangs
+)
+
+echo "---------------------------------------------------------"
+echo ">>> INITIALIZING DVGRAB..."
+echo ">>> COMMANDING CAMERA TO PLAY..."
+echo ">>> (If tape doesn't move in 5s, press PLAY on camera)."
+echo ">>> Press Ctrl+C to stop. Then press STOP on the camera."
+echo "---------------------------------------------------------"
+
+# ==============================================================================
+# 7. Execution & Logging
+# ==============================================================================
+# || true ensures the script continues to the Audit even if dvgrab
+# exits non-zero (normal on tape end)
+dvgrab "${FLAGS[@]}" "$OUTPUT_DIR/${BASE_NAME}" 2>&1 | tee "$LOG_FILE" || true
+
+# ==============================================================================
+# 8. Post-Capture Integrity Audit
+# ==============================================================================
+printf '\a'
+echo "---------------------------------------------------------"
+echo "RUNNING DATA INTEGRITY AUDIT..."
+
+LATEST_FILE=$(ls -t "$OUTPUT_DIR"/*.avi 2>/dev/null | head -1)
+
+if [ -f "$LATEST_FILE" ]; then
+
+    # Extract only duration= and bit_rate= lines, discarding dvvideo decoder
+    # warnings (AC EOB marker, Concealing bitstream errors) that appear at the
+    # start of analog Hi8 tapes due to garbage timecode in the tape leader.
+    STATS=$(ffprobe -v error -show_entries format=duration,bit_rate \
+        -of default=noprint_wrappers=1 "$LATEST_FILE" 2>&1 \
+        | grep -E '^(duration|bit_rate)')
+
+    BITRATE=$(echo "$STATS" | grep "^bit_rate" | cut -d= -f2 || echo "N/A")
+    DURATION=$(echo "$STATS" | grep "^duration" | cut -d= -f2 || echo "0")
+
+    # Normalise empty strings to sentinel values
+    BITRATE="${BITRATE:-N/A}"
+    DURATION="${DURATION:-0}"
+
+    # Guard: ffprobe often returns N/A for bit_rate on DV/AVI containers.
+    # Fall back to manual calculation from file size and duration.
+    if [[ "$BITRATE" == "N/A" || "$BITRATE" == "0" ]]; then
+        if [[ "$DURATION" == "0" || "$DURATION" == "N/A" ]]; then
+            echo "[WARNING] Could not determine duration or bitrate. File may be empty." | tee -a "$LOG_FILE"
+            BITRATE_MBPS="0"
+        else
+            FILE_SIZE=$(stat -c%s "$LATEST_FILE")
+            BITRATE=$(echo "scale=0; ($FILE_SIZE * 8) / $DURATION" | bc)
+            BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
+            echo "[INFO] Bitrate calculated from file size (ffprobe returned N/A — normal for DV/AVI)." | tee -a "$LOG_FILE"
+        fi
+    else
+        BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
+    fi
+
+    if [[ "$BITRATE_MBPS" != "0" ]]; then
+        # Convert duration to h:mm:ss for readability
+        DURATION_INT=${DURATION%.*}
+        DURATION_HMS=$(printf '%d:%02d:%02d' \
+            $((DURATION_INT / 3600)) \
+            $(((DURATION_INT % 3600) / 60)) \
+            $((DURATION_INT % 60)))
+
+        {
+            echo "DATA INTEGRITY AUDIT: $BASE_NAME"
+            echo "Generated: $(date)"
+            echo "---------------------------------------------------------"
+            echo "File:     $(basename "$LATEST_FILE")"
+            echo "Duration: ${DURATION_HMS} (${DURATION}s)"
+            echo "Bitrate:  ${BITRATE_MBPS} Mbps"
+            # DV NTSC standard is ~25 Mbps video + ~1.5 Mbps PCM audio = ~28.5 Mbps total
+            # Below 28.0 Mbps suggests dropped frames or a degraded stream
+            if (( $(echo "$BITRATE_MBPS < 28.0" | bc -l) )); then
+                echo "[!!!] WARNING: Low bitrate. Check $LOG_FILE for dropped frames."
+            else
+                echo "[SUCCESS] High-integrity capture confirmed."
+            fi
+            echo "---------------------------------------------------------"
+        } | tee -a "$LOG_FILE"
+    fi
+else
+    echo "[ERROR] No AVI file was generated. Check $LOG_FILE" | tee -a "$LOG_FILE"
+    exit 1
+fi
+
+# ==============================================================================
+# 9. Recording Date Analysis
+# ==============================================================================
+# dvgrab writes lines like:
+#   "file001.avi": 30.75 MiB 254 frames timecode 00:00:10.15 date 1995.07.28 14:23:11
+# We extract dates, filter to valid years (1980-2010), deduplicate, and report.
+# Analog Hi8 tapes have no internal clock so all dates will be garbage (e.g. 2067)
+# and will be filtered out — this is expected and the warning reflects that.
+echo "---------------------------------------------------------"
+echo "ANALYSING RECORDING DATES..."
+
+if [ -f "$LOG_FILE" ]; then
+    # Extract all dates in YYYY.MM.DD format, filter to sane year range
+    VALID_DATES=$(grep -oP 'date \K\d{4}\.\d{2}\.\d{2}' "$LOG_FILE" \
+        | awk -F. '$1 >= 1980 && $1 <= 2010' \
+        | sort -u)
+
+    if [[ -n "$VALID_DATES" ]]; then
+        DATE_COUNT=$(echo "$VALID_DATES" | wc -l)
+
+        # First and last valid full timestamps
+        FIRST_STAMP=$(grep -oP 'date \K\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}' "$LOG_FILE" \
+            | awk -F'[. ]' '$1 >= 1980 && $1 <= 2010' | head -1)
+        LAST_STAMP=$(grep -oP 'date \K\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}' "$LOG_FILE" \
+            | awk -F'[. ]' '$1 >= 1980 && $1 <= 2010' | tail -1)
+
+        # Build the report — write to both terminal and date report file
+        {
+            echo "RECORDING DATE REPORT: $BASE_NAME"
+            echo "Generated: $(date)"
+            echo "---------------------------------------------------------"
+            echo "Unique recording dates found on tape:"
+            echo "$VALID_DATES" | while read -r d; do echo "  $d"; done
+            echo ""
+            echo "Total unique dates: $DATE_COUNT"
+            echo "First valid timestamp: $FIRST_STAMP"
+            echo "Last valid timestamp:  $LAST_STAMP"
+            echo "---------------------------------------------------------"
+            echo "NOTE: Dates outside 1980-2010 were filtered as garbage timecode."
+            echo "      If your tape predates 1980 or postdates 2010, edit the"
+            echo "      year range filter in the script."
+        } | tee "$DATE_REPORT"
+
+    else
+        echo "[INFO] No valid recording dates found in log."
+        echo "       This is expected for analog Hi8 tapes — they have no internal"
+        echo "       clock, so dvgrab reports garbage timecodes (e.g. 2067) which"
+        echo "       are correctly filtered out. Your capture is not affected."
+        echo "[INFO] No valid recording dates found (analog Hi8 — expected)." >> "$LOG_FILE"
+    fi
+else
+    echo "[WARNING] Log file not found. Cannot analyse recording dates."
+fi
+
+echo "---------------------------------------------------------"
+echo "Done."
+echo "Log:         $LOG_FILE"
+if [ -f "$DATE_REPORT" ]; then
+    echo "Date report: $DATE_REPORT"
+fi

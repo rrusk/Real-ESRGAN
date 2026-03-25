@@ -240,52 +240,106 @@ echo "---------------------------------------------------------"
 # Integer arithmetic using exact NTSC ratio 1001/30000.
 PROGRESS_FRAMES=$(( PROGRESS_INTERVAL_SEC * 2997 / 100 ))
 
-# dvgrab --showstatus emits a status line for every frame update. The awk
-# filter below passes through important lines immediately (damage warnings,
-# start/stop markers, autosplit notices, the final summary) and samples
-# progress lines at PROGRESS_FRAMES intervals so the console stays readable
-# and the log stays manageable. Each sampled progress line is prefixed with
-# an approximate tape position derived from the frame count, giving useful
-# brackets around any damaged-frame warnings.
+# Output file prefix passed to awk for real-time bitrate estimation.
+OUTPUT_FILE_PREFIX="$OUTPUT_DIR/${BASE_NAME}"
+
+# Seconds without frame progress before a stall warning is emitted.
+STALL_TIMEOUT_SEC=120
+
+# dvgrab --showstatus uses \r to overwrite the terminal line in place,
+# producing a stream of \r-separated records with no \n between them.
+# RS="\r" in awk BEGIN makes it correctly split on carriage returns
+# before any rule runs — split($0,...,"\r") failed because the entire
+# stream arrived as one \n-terminated blob.
+#
+# Features:
+#   - Progress sampled every PROGRESS_INTERVAL_SEC with tape position
+#   - Real-time bitrate summed across all segment files (autosplit-safe)
+#   - Stall detection: warns if frame count unchanged for STALL_TIMEOUT_SEC
+#   - Damage warnings and lifecycle messages pass through immediately
+#
+# stdbuf -oL forces line-buffering on dvgrab's stdout so \r-terminated
+# records reach awk promptly rather than accumulating in a block buffer.
 #
 # || true ensures the script continues to the Audit even if dvgrab
 # exits non-zero (normal on tape end).
-dvgrab "${FLAGS[@]}" "$OUTPUT_DIR/${BASE_NAME}" 2>&1 \
-| awk -v interval="$PROGRESS_FRAMES" '
-    # Always pass through: damage warnings and their explanation line,
-    # capture lifecycle messages, autosplit notices, final summary warnings.
-    /damaged frame|missing or invalid|Capture Start|Capture Stop|Warning:|Autosplit/ {
-        print; fflush(); next
+stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
+| awk -v interval="$PROGRESS_FRAMES" \
+      -v outfile_prefix="$OUTPUT_FILE_PREFIX" \
+      -v stall_sec="$STALL_TIMEOUT_SEC" '
+    BEGIN {
+        RS = "\r"
+        last_printed      = -1
+        last_frame_seen   = -1
+        last_progress_time = systime()
     }
+    {
+        # RS="\r" splits on carriage returns before any rule runs, so each
+        # dvgrab status update arrives as its own record. Strip whitespace
+        # and skip blank records (the spacer padding dvgrab emits).
+        line = $0
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+        if (line == "") next
 
-    # Progress lines contain " frames " — sample every N frames and annotate
-    # with an approximate h:mm:ss position for easy scrubbing in the AVI.
-    / frames / {
-        # match() is more robust than field-walking; immune to column
-        # shifts from localization or dvgrab version differences.
-        # else { next } guards against reusing a stale frame_count if
-        # match() fails on an unexpected line format.
-        if (match($0, /([0-9]+) frames/, m)) {
+        # Always pass through: damage warnings, lifecycle messages,
+        # autosplit notices. Broader pattern catches dvgrab variants.
+        if (line ~ /(damaged|missing|invalid|[Ee]rror|Warning:|Autosplit|Capture Start|Capture Stop)/) {
+            print line; fflush(); next
+        }
+
+        # Progress lines: extract frame count, apply stall detection
+        # and interval sampling, annotate with position and bitrate.
+        if (match(line, /([0-9]+)[[:space:]]+frames/, m)) {
             frame_count = m[1]
-        } else {
+            now = systime()
+
+            # Stall detection: == (not <=) avoids false positives when
+            # dvgrab briefly repeats a frame count at segment boundaries.
+            if (last_frame_seen >= 0 && frame_count == last_frame_seen) {
+                if (now - last_progress_time >= stall_sec) {
+                    printf "[WARNING] Capture stalled — no frame progress for ~%ds\n", \
+                           now - last_progress_time
+                    fflush()
+                    last_progress_time = now
+                }
+            } else {
+                last_progress_time = now
+            }
+            last_frame_seen = frame_count
+
+            # Sample at interval, always print first line
+            if (last_printed < 0 || frame_count - last_printed >= interval) {
+                total_sec = int(frame_count * 1001 / 30000)
+                h  = int(total_sec / 3600)
+                m_ = int((total_sec % 3600) / 60)
+                s  = total_sec % 60
+
+                # Real-time bitrate from cumulative size of ALL segment
+                # files so the estimate stays accurate across autosplits
+                # and does not dip at file boundaries.
+                bitrate_mbps = "N/A"
+                if (total_sec > 5) {
+                    filesize = 0
+                    cmd = "stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null"
+                    while ((cmd | getline sz) > 0) {
+                        filesize += sz
+                    }
+                    close(cmd)
+                    if (filesize > 0) {
+                        bitrate_mbps = sprintf("%.2f", (filesize * 8) / total_sec / 1000000)
+                    }
+                }
+                printf "[PROGRESS ~%d:%02d:%02d | %s Mbps] %s\n", \
+                       h, m_, s, bitrate_mbps, line
+                fflush()
+                last_printed = frame_count
+            }
             next
         }
-        if (frame_count - last_printed >= interval || last_printed == 0) {
-            # Use exact NTSC ratio 1001/30000 in both shell and awk to
-            # avoid drift between integer and float math over a 2-hour tape.
-            total_sec = int(frame_count * 1001 / 30000)
-            h   = int(total_sec / 3600)
-            m_  = int((total_sec % 3600) / 60)
-            s   = total_sec % 60
-            printf "[PROGRESS ~%d:%02d:%02d] %s\n", h, m_, s, $0
-            fflush()
-            last_printed = frame_count
-        }
-        next
-    }
 
-    # Pass through everything else (device init messages, blank lines, etc.)
-    { print; fflush() }
+        # Pass through everything else (device init messages, etc.)
+        print line; fflush()
+    }
 ' | tee "$LOG_FILE" || true
 
 # ==============================================================================

@@ -269,36 +269,54 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
       -v stall_sec="$STALL_TIMEOUT_SEC" '
     BEGIN {
         RS = "\r"
-        last_printed      = -1
-        last_frame_seen   = -1
+        last_printed       = -1
+        last_frame_seen    = -1
         last_progress_time = systime()
     }
     {
         # RS="\r" splits on carriage returns before any rule runs, so each
         # dvgrab status update arrives as its own record. Strip whitespace
-        # and skip blank records (the spacer padding dvgrab emits).
+        # and skip blank records (spacer padding dvgrab emits).
         line = $0
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
         if (line == "") next
 
-        # Always pass through: damage warnings, lifecycle messages,
-        # autosplit notices. Broader pattern catches dvgrab variants.
+        # Critical lines: wrap errors and warnings in a visible banner.
+        # Lifecycle messages (Capture Start/Stop, Autosplit) pass through
+        # without a banner as they are informational, not alerts.
+        # Deduplication (warned[]) prevents banner spam when dvgrab emits
+        # the same warning repeatedly for a single event.
         if (line ~ /(damaged|missing|invalid|[Ee]rror|Warning:|Autosplit|Capture Start|Capture Stop)/) {
-            print line; fflush(); next
+            if (line ~ /(damaged|missing|invalid|[Ee]rror|Warning:)/) {
+                if (!(line in warned)) {
+                    warned[line] = 1
+                    print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                    print "!!! " line
+                    print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                    fflush()
+                }
+            } else {
+                print line; fflush()
+            }
+            next
         }
 
         # Progress lines: extract frame count, apply stall detection
         # and interval sampling, annotate with position and bitrate.
+        # Timecode and date fields are stripped — on Hi8 analog tapes
+        # they are always garbage (e.g. 45:85:85.45, 2067.02.15) and
+        # add no useful information to the output.
         if (match(line, /([0-9]+)[[:space:]]+frames/, m)) {
             frame_count = m[1]
             now = systime()
 
-            # Stall detection: == (not <=) avoids false positives when
-            # dvgrab briefly repeats a frame count at segment boundaries.
+            # Stall detection: == avoids false positives when dvgrab
+            # briefly repeats a frame count at segment boundaries.
             if (last_frame_seen >= 0 && frame_count == last_frame_seen) {
                 if (now - last_progress_time >= stall_sec) {
-                    printf "[WARNING] Capture stalled — no frame progress for ~%ds\n", \
-                           now - last_progress_time
+                    printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                    printf "!!! WARNING: Capture stalled — no frame progress for ~%ds\n", now - last_progress_time
+                    printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
                     fflush()
                     last_progress_time = now
                 }
@@ -314,23 +332,27 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
                 m_ = int((total_sec % 3600) / 60)
                 s  = total_sec % 60
 
+                # Strip timecode and date only when they are the Hi8
+                # garbage pattern (e.g. 45:85:85.45, date 2067.xx.xx).
+                # Valid Digital8 timecodes and dates are preserved.
+                clean = line
+                if (clean ~ /timecode [0-9]{2}:[8-9][0-9]:[8-9][0-9]/) {
+                    gsub(/ timecode [^ ]+/, "", clean)
+                    gsub(/ date [0-9]+\.[0-9]+\.[0-9]+ [0-9:]+/, "", clean)
+                }
+
                 # Real-time bitrate from cumulative size of ALL segment
-                # files so the estimate stays accurate across autosplits
-                # and does not dip at file boundaries.
+                # files — accurate across autosplits, stable at boundaries.
                 bitrate_mbps = "N/A"
                 if (total_sec > 5) {
                     filesize = 0
                     cmd = "stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null"
-                    while ((cmd | getline sz) > 0) {
-                        filesize += sz
-                    }
+                    while ((cmd | getline sz) > 0) filesize += sz
                     close(cmd)
-                    if (filesize > 0) {
+                    if (filesize > 0)
                         bitrate_mbps = sprintf("%.2f", (filesize * 8) / total_sec / 1000000)
-                    }
                 }
-                printf "[PROGRESS ~%d:%02d:%02d | %s Mbps] %s\n", \
-                       h, m_, s, bitrate_mbps, line
+                printf "[PROGRESS ~%d:%02d:%02d | %s Mbps] %s\n", h, m_, s, bitrate_mbps, clean
                 fflush()
                 last_printed = frame_count
             }

@@ -45,7 +45,7 @@ CAPTURE_ROOT="/mnt/video_capture/avi/captures"
 PROGRESS_INTERVAL_SEC=60
 
 # ==============================================================================
-# main() — entire script body
+# main() -- entire script body
 # bash reads and parses this function completely before executing it, so any
 # edits made to this file after the script starts are safely ignored.
 # ==============================================================================
@@ -172,7 +172,7 @@ DATE_REPORT="${OUTPUT_DIR}/${BASE_NAME}.dates.txt"
 # SESSION_DATE makes this unlikely, but protects against same-minute re-runs
 # ==============================================================================
 mkdir -p "$OUTPUT_DIR"
-# find is more reliable than ls -A for non-empty check — handles odd filenames
+# find is more reliable than ls -A for non-empty check -- handles odd filenames
 # and avoids word-splitting on the subshell output.
 if [ "$(find "$OUTPUT_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
     echo "[WARNING] Output directory is not empty: $OUTPUT_DIR"
@@ -249,7 +249,7 @@ STALL_TIMEOUT_SEC=120
 # dvgrab --showstatus uses \r to overwrite the terminal line in place,
 # producing a stream of \r-separated records with no \n between them.
 # RS="\r" in awk BEGIN makes it correctly split on carriage returns
-# before any rule runs — split($0,...,"\r") failed because the entire
+# before any rule runs -- split($0,...,"\r") failed because the entire
 # stream arrived as one \n-terminated blob.
 #
 # Features:
@@ -275,21 +275,31 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
     }
     {
         # RS="\r" splits on carriage returns before any rule runs, so each
-        # dvgrab status update arrives as its own record. Strip whitespace
-        # and skip blank records (spacer padding dvgrab emits).
+        # dvgrab status update arrives as its own record. Strip whitespace,
+        # control characters (including BEL 0x07 that dvgrab prefixes to
+        # damage warnings), and skip blank records.
         line = $0
+        gsub(/[\x00-\x1F]/, "", line)
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
         if (line == "") next
+
+        # Suppress the boilerplate explanation line that dvgrab emits after
+        # every damage warning -- it adds no information and breaks dedup.
+        if (line == "This means that there were missing or invalid FireWire packets.") next
 
         # Critical lines: wrap errors and warnings in a visible banner.
         # Lifecycle messages (Capture Start/Stop, Autosplit) pass through
         # without a banner as they are informational, not alerts.
-        # Deduplication (warned[]) prevents banner spam when dvgrab emits
-        # the same warning repeatedly for a single event.
+        # Deduplication uses a stable key with timecode/date stripped so
+        # that BEL prefix differences and garbage timestamp variations
+        # do not cause the same logical warning to appear multiple times.
         if (line ~ /(damaged|missing|invalid|[Ee]rror|Warning:|Autosplit|Capture Start|Capture Stop)/) {
             if (line ~ /(damaged|missing|invalid|[Ee]rror|Warning:)/) {
-                if (!(line in warned)) {
-                    warned[line] = 1
+                key = line
+                gsub(/ timecode [^ ]+/, "", key)
+                gsub(/ date [0-9.]+[[:space:]]+[0-9:]+/, "", key)
+                if (!(key in warned)) {
+                    warned[key] = 1
                     print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
                     print "!!! " line
                     print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
@@ -303,7 +313,7 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
 
         # Progress lines: extract frame count, apply stall detection
         # and interval sampling, annotate with position and bitrate.
-        # Timecode and date fields are stripped — on Hi8 analog tapes
+        # Timecode and date fields are stripped -- on Hi8 analog tapes
         # they are always garbage (e.g. 45:85:85.45, 2067.02.15) and
         # add no useful information to the output.
         if (match(line, /([0-9]+)[[:space:]]+frames/, m)) {
@@ -315,7 +325,7 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
             if (last_frame_seen >= 0 && frame_count == last_frame_seen) {
                 if (now - last_progress_time >= stall_sec) {
                     printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-                    printf "!!! WARNING: Capture stalled — no frame progress for ~%ds\n", now - last_progress_time
+                    printf "!!! WARNING: Capture stalled -- no frame progress for ~%ds\n", now - last_progress_time
                     printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
                     fflush()
                     last_progress_time = now
@@ -342,7 +352,7 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
                 }
 
                 # Real-time bitrate from cumulative size of ALL segment
-                # files — accurate across autosplits, stable at boundaries.
+                # files -- accurate across autosplits, stable at boundaries.
                 bitrate_mbps = "N/A"
                 if (total_sec > 5) {
                     filesize = 0
@@ -382,7 +392,7 @@ if [ "${#AVI_FILES[@]}" -eq 0 ]; then
     exit 1
 fi
 
-# ls -t sorts by modification time — correct for autosplit edge cases where
+# ls -t sorts by modification time -- correct for autosplit edge cases where
 # lexicographic sort would mis-order file9.avi vs file10.avi.
 # Using the array as explicit arguments (not a glob) is a safe use of ls.
 LATEST_FILE=$(ls -t -- "${AVI_FILES[@]}" | head -1)
@@ -413,7 +423,7 @@ if [ -f "$LATEST_FILE" ]; then
             FILE_SIZE=$(stat -c%s "$LATEST_FILE")
             BITRATE=$(echo "scale=0; ($FILE_SIZE * 8) / $DURATION" | bc)
             BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
-            echo "[INFO] Bitrate calculated from file size (ffprobe returned N/A — normal for DV/AVI)." | tee -a "$LOG_FILE"
+            echo "[INFO] Bitrate calculated from file size (ffprobe returned N/A -- normal for DV/AVI)." | tee -a "$LOG_FILE"
         fi
     else
         BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
@@ -453,7 +463,7 @@ fi
 #   "file001.avi": 30.75 MiB 254 frames timecode 00:00:10.15 date 1995.07.28 14:23:11
 # We extract dates, filter to valid years (1980-2010), deduplicate, and report.
 # Analog Hi8 tapes have no internal clock so all dates will be garbage (e.g. 2067)
-# and will be filtered out — this is expected and the warning reflects that.
+# and will be filtered out -- this is expected and the warning reflects that.
 echo "---------------------------------------------------------"
 echo "ANALYSING RECORDING DATES..."
 
@@ -476,7 +486,7 @@ if [ -f "$LOG_FILE" ]; then
             | cut -d' ' -f2-3 \
             | awk -F'[. ]' '$1 >= 1980 && $1 <= 2010' | tail -1)
 
-        # Build the report — write to both terminal and date report file
+        # Build the report -- write to both terminal and date report file
         {
             echo "RECORDING DATE REPORT: $BASE_NAME"
             echo "Generated: $(date)"
@@ -495,10 +505,10 @@ if [ -f "$LOG_FILE" ]; then
 
     else
         echo "[INFO] No valid recording dates found in log."
-        echo "       This is expected for analog Hi8 tapes — they have no internal"
+        echo "       This is expected for analog Hi8 tapes -- they have no internal"
         echo "       clock, so dvgrab reports garbage timecodes (e.g. 2067) which"
         echo "       are correctly filtered out. Your capture is not affected."
-        echo "[INFO] No valid recording dates found (analog Hi8 — expected)." >> "$LOG_FILE"
+        echo "[INFO] No valid recording dates found (analog Hi8 -- expected)." >> "$LOG_FILE"
     fi
 else
     echo "[WARNING] Log file not found. Cannot analyse recording dates."

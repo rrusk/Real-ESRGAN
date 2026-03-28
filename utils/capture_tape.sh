@@ -56,10 +56,16 @@ main() {
 # ==============================================================================
 usage() {
     echo ""
-    echo "Usage: $0 [-o OUTPUT_DIR] <TAPE_ID> [DESCRIPTION]"
+    echo "Usage: $0 [-o OUTPUT_DIR] [-t hi8|dv] <TAPE_ID> [DESCRIPTION]"
     echo ""
     echo "  -o OUTPUT_DIR  Optional. Override the default capture root."
     echo "                 Default: ${CAPTURE_ROOT}"
+    echo "  -t TAPE_TYPE   Optional. Tape format: hi8 (default) or dv (Digital8)."
+    echo "                 hi8:  Single large file, session date in filename."
+    echo "                       Warns if valid timecodes are found (suggests -t dv)."
+    echo "                 dv:   Files split by recording segment, named using the"
+    echo "                       filming date embedded in the DV stream."
+    echo "                       e.g. dv_1997.08.03_14.23.11.avi"
     echo "  TAPE_ID        Required. A short unique identifier for the tape."
     echo "                 Spaces are allowed and will be converted to underscores."
     echo "  DESCRIPTION    Optional. Additional context appended to the filename."
@@ -68,22 +74,20 @@ usage() {
     echo "  $0 TAPE01"
     echo "     -> ${CAPTURE_ROOT}/TAPE01_20250319_1430/TAPE01_20250319_1430001.avi"
     echo ""
-    echo "  $0 '1995 Summer Vacation'"
-    echo "     -> ${CAPTURE_ROOT}/1995_Summer_Vacation_20250319_1430/1995_Summer_Vacation_20250319_1430001.avi"
+    echo "  $0 -t dv dv"
+    echo "     -> ${CAPTURE_ROOT}/dv_20250319_1430/dv_1997.08.03_14.23.11.avi"
+    echo "                                          dv_1997.08.15_09.12.44.avi"
     echo ""
     echo "  $0 BOX2_TAPE04 'Christmas 1998'"
     echo "     -> ${CAPTURE_ROOT}/BOX2_TAPE04_Christmas_1998_20250319_1430/BOX2_TAPE04_Christmas_1998_20250319_1430001.avi"
     echo ""
-    echo "  $0 -o /tmp/test TAPE01 'Summer 1995'"
-    echo "     -> /tmp/test/TAPE01_Summer_1995_20250319_1430/TAPE01_Summer_1995_20250319_1430001.avi"
-    echo ""
     echo "Notes:"
     echo "  - Spaces are converted to underscores automatically."
     echo "  - Special characters are stripped for filesystem safety."
-    echo "  - Capture date is appended so repeat captures don't overwrite each other."
-    echo "  - Output files are placed in CAPTURE_ROOT/<n>/ with a matching log."
-    echo "  - For Digital8 tapes, the original filming date is preserved inside"
-    echo "    the DV stream and can be extracted later with dvgrab or ffprobe."
+    echo "  - Capture date is appended to the directory name so repeat captures"
+    echo "    of the same tape do not overwrite each other."
+    echo "  - For Digital8 (-t dv), files are named using the filming date so"
+    echo "    they sort chronologically. The capture date is in the directory name."
     echo "  - After capture, all unique recording dates found on the tape are"
     echo "    reported. Garbage timecodes outside 1980-2010 are filtered out."
     echo ""
@@ -101,10 +105,20 @@ fi
 # ==============================================================================
 # 1. Argument Parsing
 # ==============================================================================
-while getopts ":o:" opt; do
+TAPE_TYPE="hi8"   # default; override with -t dv
+
+while getopts ":o:t:" opt; do
     case $opt in
         o)
             CAPTURE_ROOT="$OPTARG"
+            ;;
+        t)
+            TAPE_TYPE="$OPTARG"
+            if [[ "$TAPE_TYPE" != "hi8" && "$TAPE_TYPE" != "dv" ]]; then
+                echo "[ERROR] -t must be 'hi8' or 'dv' (got: $TAPE_TYPE)"
+                usage
+                exit 1
+            fi
             ;;
         \?)
             echo "[ERROR] Unknown option: -$OPTARG"
@@ -209,22 +223,39 @@ fi
 # ==============================================================================
 # 6. Flag Configuration (Bash Array)
 # ==============================================================================
-# Note: --timestamp intentionally omitted. SESSION_DATE in BASE_NAME records
-# the capture date instead. For analog Hi8 (1993-2003) there is no internal
-# tape date anyway. For Digital8, the original filming date is preserved
-# inside the DV stream and can be extracted later with dvgrab or ffprobe.
-FLAGS=(
-    --format dv2     # Type 2 AVI (Standard for FFmpeg/AI pipeline)
-    --size 0         # Single large file; no size-based splitting
-    --autosplit      # Split ONLY on signal loss or timecode jumps
-    --opendml        # Support files >4GB (essential for 120min tapes)
-    --showstatus     # Emit continuous progress lines; filtered below to one
-                     # per PROGRESS_INTERVAL_SEC so damaged-frame warnings
-                     # can be bracketed by approximate tape position.
-                     # Without this, dvgrab only prints a status line at the
-                     # very end of capture (when --size 0 closes the file).
-    # --noavc        # Uncomment if camera mechanical control hangs
-)
+if [[ "$TAPE_TYPE" == "dv" ]]; then
+    # Digital8: --timestamp names each file using the filming date embedded
+    # in the DV stream so files sort chronologically by when content was filmed.
+    # --size 0 is omitted so dvgrab can split on timecode discontinuities,
+    # producing one file per recording session on the tape.
+    FLAGS=(
+        --format dv1     # Type 1 AVI -- matches existing Digital8 captures
+                         # for checksum comparison. dv1 stores a single
+                         # integrated DV track (vs dv2 which adds a separate
+                         # audio track). Use dv2 if compatibility with other
+                         # tools is needed.
+        --timestamp      # Name files using embedded DV recording date
+        --autosplit      # Split on signal loss or timecode jumps
+        --opendml        # Support files >4GB
+        --showstatus
+        # --noavc        # Uncomment if camera mechanical control hangs
+    )
+else
+    # Hi8 analog: no valid internal timecodes, so use a single large file
+    # named with the capture session date.
+    FLAGS=(
+        --format dv2
+        --size 0         # Single large file; no size-based splitting
+        --autosplit      # Split ONLY on signal loss or timecode jumps
+        --opendml        # Support files >4GB (essential for 120min tapes)
+        --showstatus     # Emit continuous progress lines; filtered below to one
+                         # per PROGRESS_INTERVAL_SEC so damaged-frame warnings
+                         # can be bracketed by approximate tape position.
+                         # Without this, dvgrab only prints a status line at the
+                         # very end of capture (when --size 0 closes the file).
+        # --noavc        # Uncomment if camera mechanical control hangs
+    )
+fi
 
 echo "---------------------------------------------------------"
 echo ">>> INITIALIZING DVGRAB..."
@@ -240,8 +271,18 @@ echo "---------------------------------------------------------"
 # Integer arithmetic using exact NTSC ratio 1001/30000.
 PROGRESS_FRAMES=$(( PROGRESS_INTERVAL_SEC * 2997 / 100 ))
 
-# Output file prefix passed to awk for real-time bitrate estimation.
-OUTPUT_FILE_PREFIX="$OUTPUT_DIR/${BASE_NAME}"
+# Output file prefix passed to dvgrab and awk.
+# For Digital8: use only SAFE_ID so dvgrab appends the filming date directly,
+# giving files like "dv_1997.08.03_14.23.11.avi" that sort by content date.
+# The capture session date is preserved in OUTPUT_DIR for provenance.
+# For Hi8: use the full BASE_NAME including session date.
+if [[ "$TAPE_TYPE" == "dv" ]]; then
+    OUTPUT_FILE_PREFIX="$OUTPUT_DIR/${SAFE_ID}_"
+    echo "[MODE] Digital8 -- files named by filming date, split by segment."
+else
+    OUTPUT_FILE_PREFIX="$OUTPUT_DIR/${BASE_NAME}"
+    echo "[MODE] Analog Hi8 -- single file, named by capture session date."
+fi
 
 # Seconds without frame progress before a stall warning is emitted.
 STALL_TIMEOUT_SEC=120
@@ -266,12 +307,14 @@ STALL_TIMEOUT_SEC=120
 stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
 | awk -v interval="$PROGRESS_FRAMES" \
       -v outfile_prefix="$OUTPUT_FILE_PREFIX" \
-      -v stall_sec="$STALL_TIMEOUT_SEC" '
+      -v stall_sec="$STALL_TIMEOUT_SEC" \
+      -v tape_type="$TAPE_TYPE" '
     BEGIN {
         RS = "\r"
         last_printed       = -1
         last_frame_seen    = -1
         last_progress_time = systime()
+        hi8_valid_tc_warned = 0
     }
     {
         # RS="\r" splits on carriage returns before any rule runs, so each
@@ -335,21 +378,26 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
             }
             last_frame_seen = frame_count
 
+            # If running in Hi8 mode but the tape has valid timecodes,
+            # warn once that Digital8 mode (-t dv) would be more appropriate.
+            if (tape_type == "hi8" && !hi8_valid_tc_warned) {
+                if (line ~ /timecode ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\./) {
+                    print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                    print "!!! WARNING: Valid timecodes detected on this tape."
+                    print "!!! This may be a Digital8 tape. Re-capture with -t dv"
+                    print "!!! to split files by filming date for chronological sorting."
+                    print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                    fflush()
+                    hi8_valid_tc_warned = 1
+                }
+            }
+
             # Sample at interval, always print first line
             if (last_printed < 0 || frame_count - last_printed >= interval) {
                 total_sec = int(frame_count * 1001 / 30000)
                 h  = int(total_sec / 3600)
                 m_ = int((total_sec % 3600) / 60)
                 s  = total_sec % 60
-
-                # Strip timecode and date only when they are the Hi8
-                # garbage pattern (e.g. 45:85:85.45, date 2067.xx.xx).
-                # Valid Digital8 timecodes and dates are preserved.
-                clean = line
-                if (clean ~ /timecode [0-9]{2}:[8-9][0-9]:[8-9][0-9]/) {
-                    gsub(/ timecode [^ ]+/, "", clean)
-                    gsub(/ date [0-9]+\.[0-9]+\.[0-9]+ [0-9:]+/, "", clean)
-                }
 
                 # Real-time bitrate from cumulative size of ALL segment
                 # files -- accurate across autosplits, stable at boundaries.
@@ -362,9 +410,47 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
                     if (filesize > 0)
                         bitrate_mbps = sprintf("%.2f", (filesize * 8) / total_sec / 1000000)
                 }
-                printf "[PROGRESS ~%d:%02d:%02d | %s Mbps] %s\n", h, m_, s, bitrate_mbps, clean
+
+                if (tape_type == "dv") {
+                    # For Digital8: timecodes are valid so use them directly
+                    # as the position reference. Extract size and timecode
+                    # from the line and format a compact progress line without
+                    # the filename (which changes on every autosplit and would
+                    # stall on the first segment name).
+                    size_mib = "?"
+                    tc = "?"
+                    if (match(line, /([0-9.]+) MiB/, a))  size_mib = a[1]
+                    if (match(line, /timecode ([0-9:]+\.[0-9]+)/, a)) tc = a[1]
+                    printf "[PROGRESS %s | %s MiB | %s Mbps]\n", tc, size_mib, bitrate_mbps
+                } else {
+                    # For Hi8: strip garbage timecode/date, keep filename for
+                    # context since there is only one file and no valid tc.
+                    clean = line
+                    if (clean ~ /timecode [0-9]{2}:[8-9][0-9]:[8-9][0-9]/) {
+                        gsub(/ timecode [^ ]+/, "", clean)
+                        gsub(/ date [0-9]+\.[0-9]+\.[0-9]+ [0-9:]+/, "", clean)
+                    }
+                    printf "[PROGRESS ~%d:%02d:%02d | %s Mbps] %s\n", h, m_, s, bitrate_mbps, clean
+                }
                 fflush()
                 last_printed = frame_count
+            }
+            next
+        }
+
+        # For Digital8: detect when dvgrab opens a new segment file due to
+        # autosplit and announce it clearly so the operator knows a new
+        # recording session has started on the tape.
+        if (tape_type == "dv" && line ~ /\.avi":/ && line !~ /frames/) {
+            fname = line
+            gsub(/.*\//, "", fname)   # strip path, keep filename
+            gsub(/".*/, "", fname)    # strip trailing quote and anything after
+            if (fname != last_fname && fname != "") {
+                print "---------------------------------------------------------"
+                print ">>> NEW SEGMENT: " fname
+                print "---------------------------------------------------------"
+                fflush()
+                last_fname = fname
             }
             next
         }
@@ -504,11 +590,16 @@ if [ -f "$LOG_FILE" ]; then
         } | tee "$DATE_REPORT"
 
     else
-        echo "[INFO] No valid recording dates found in log."
-        echo "       This is expected for analog Hi8 tapes -- they have no internal"
-        echo "       clock, so dvgrab reports garbage timecodes (e.g. 2067) which"
-        echo "       are correctly filtered out. Your capture is not affected."
-        echo "[INFO] No valid recording dates found (analog Hi8 -- expected)." >> "$LOG_FILE"
+        if [[ "$TAPE_TYPE" == "dv" ]]; then
+            echo "[WARNING] Digital8 mode but no valid recording dates found in log."
+            echo "          The DV stream may have incomplete timecode data."
+        else
+            echo "[INFO] No valid recording dates found in log."
+            echo "       This is expected for analog Hi8 tapes -- they have no internal"
+            echo "       clock, so dvgrab reports garbage timecodes (e.g. 2067) which"
+            echo "       are correctly filtered out. Your capture is not affected."
+            echo "[INFO] No valid recording dates found (analog Hi8 -- expected)." >> "$LOG_FILE"
+        fi
     fi
 else
     echo "[WARNING] Log file not found. Cannot analyse recording dates."

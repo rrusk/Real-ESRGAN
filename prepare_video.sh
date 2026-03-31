@@ -2,24 +2,30 @@
 # ==============================================================================
 # Script Name: prepare_video.sh
 # Description: Smart deinterlacing & mastering for AI-upscaling pipeline.
-# Handles Raw VHS captures and digital files with dynamic detection.
+# Handles Raw DV/Hi8 captures, DVD MPEG-2, and progressive digital files
+# with dynamic detection.
+#
+# NOTE: The entire script is wrapped in main() so that bash reads the complete
+# file into memory before execution begins. This prevents mid-run file
+# replacement from affecting an in-progress encode.
 # ==============================================================================
 set -euo pipefail
+
+main() {
 
 # 0. Virtual Environment Guard ---
 # Ensures consistent tool versions (ffmpeg, python) across the pipeline.
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-    echo -e "\n[!] ERROR: Virtual environment not detected."
-    echo "    This script must be run within the project venv to ensure"
-    echo "    consistent tool versions and pathing."
-    echo "    Run: source venv/bin/activate"
-#    exit 1
+    echo -e "\n[!] WARNING: Virtual environment not detected."
+    echo "    This pipeline requires specific versions (e.g., numpy<2.0) found in venv."
+    echo "    Recommended: source venv/bin/activate"
+    echo "    Continuing without venv — tool versions are not guaranteed."
 fi
 
 # 1. Argument Check
 # Validates input count and provides detailed help documentation.
 if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
-    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac]"
+    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N]"
     echo ""
     echo "Arguments:"
     echo "  source_video    Path to the raw AVI, MPG, or MP4 file."
@@ -31,6 +37,10 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "                  the default behaviour is to write a .mkv master (which"
     echo "                  supports PCM natively) rather than lossy-encode to AAC."
     echo "                  Use --aac only if you specifically need an MP4 master."
+    echo "  --crf N         (Optional) x264 quality level (default: 16)."
+    echo "                  Lower = higher quality and larger file."
+    echo "                  12-14 recommended for permanent archival masters."
+    echo "                  16 is the default and suits AI upscaling pipeline input."
     echo ""
     echo "How to select mask_pixels:"
     echo "  1. Play your video in VLC and look at the bottom edge."
@@ -41,21 +51,33 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
 fi
 
 # Strict argument limit check as per previous versions
-if [ "$#" -gt 4 ]; then
+if [ "$#" -gt 6 ]; then
     echo "Error: Too many arguments."
-    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac]"
+    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N]"
     exit 1
 fi
 
 # Variable Initialization
+# SOURCE_INPUT is always the first positional argument.
+# shift moves past it so the remaining args can be parsed without risk of
+# misinterpreting a numeric filename (e.g. 12345.avi) as a mask value.
 SOURCE_INPUT="$1"
+shift
 MASK_PIXELS=0
 TEST_MODE=false
 FORCE_AAC=false
+CRF_VALUE=16
 
-# Simple parsing loop to handle optional numeric mask and named flags
+# Simple parsing loop to handle optional numeric mask and named flags.
+# Because SOURCE_INPUT has been shifted out, only genuine optional args remain.
+_NEXT_IS_CRF=false
 for arg in "$@"; do
-    if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    if [[ "$_NEXT_IS_CRF" == true ]]; then
+        CRF_VALUE="$arg"
+        _NEXT_IS_CRF=false
+    elif [[ "$arg" == "--crf" ]]; then
+        _NEXT_IS_CRF=true
+    elif [[ "$arg" =~ ^[0-9]+$ ]]; then
         MASK_PIXELS="$arg"
     elif [[ "$arg" == "--test" ]]; then
         TEST_MODE=true
@@ -105,7 +127,29 @@ echo "--- Step 1: Probing Video ---"
 PROBE_LOG=$(python3 probe_video.py "$SOURCE_INPUT")
 echo "$PROBE_LOG"
 
-# 3. Audio Strategy Detection
+# 3. Detect Source Codec
+# Used for DV-specific field order detection.
+# DV codec (dvsd, dv25, dvvideo) requires special handling:
+#   - Field order is always BFF on NTSC, but ffprobe cannot read it from
+#     the AVI container headers and returns 'unknown'.
+#   - The dvvideo decoder emits 'AC EOB marker is absent' warnings for
+#     malformed frames in the tape leader (garbage timecode region).
+#     These warnings are cosmetic, stop after the first few seconds, and
+#     do not affect the encoded output. They are left unfiltered to preserve
+#     ffmpeg's real-time progress display.
+SOURCE_CODEC=$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$SOURCE_INPUT" 2>/dev/null)
+IS_DV_SOURCE=false
+if [[ "$SOURCE_CODEC" == dv* ]]; then
+    IS_DV_SOURCE=true
+    echo "[INFO] DV codec detected ($SOURCE_CODEC) — BFF field order assumed (NTSC standard)."
+    echo "[INFO] Note: 'AC EOB marker' warnings at encode start are normal for DV tape"
+    echo "       leader frames and will stop after the first few seconds."
+fi
+
+# 4. Audio Strategy Detection
 # Detects source codec and determines re-encoding or preservation strategy.
 #
 # MP4 does not support PCM audio. When PCM is detected the output container
@@ -114,7 +158,10 @@ echo "$PROBE_LOG"
 # and handles MKV masters correctly.
 #
 # Use --aac to force AAC and keep an MP4 master (e.g. for device compatibility).
-AUDIO_FORMAT=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$SOURCE_INPUT")
+AUDIO_FORMAT=$(ffprobe -v error -select_streams a:0 \
+    -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$SOURCE_INPUT" 2>/dev/null)
 
 if [[ "$FORCE_AAC" == true ]]; then
     # User explicitly requested AAC — output stays .mp4.
@@ -134,22 +181,31 @@ else
     AUDIO_PLAN="LOSSLESS (Bitstream copy of $AUDIO_FORMAT)"
 fi
 
-# 4. Field Order and Scan Type Detection
+# 5. Field Order and Scan Type Detection
 #
-# Primary: query ffprobe stream=field_order directly. This returns clean tokens:
-#   'progressive', 'tt' (TFF), 'bb' (BFF), 'tb', 'bt', or 'unknown'.
-# Fallback: parse probe_video.py output for interlace detection when ffprobe
-#   returns 'unknown' or empty (common with DV-in-AVI and some MPEG sources).
+# Detection priority:
+#   1. DV codec shortcut — always BFF on NTSC, ffprobe cannot read from AVI headers
+#   2. ffprobe stream=field_order — reliable for MPEG-2/DVD and most MP4 sources
+#   3. probe_video.py fallback — for sources where ffprobe returns 'unknown'
 #
 FFPROBE_FIELD_ORDER=$(ffprobe -v error -select_streams v:0 \
     -show_entries stream=field_order \
     -of default=noprint_wrappers=1:nokey=1 \
-    "$SOURCE_INPUT")
+    "$SOURCE_INPUT" 2>/dev/null)
 
 # Normalise to upper-case for consistent matching
 FFPROBE_FIELD_ORDER_UC="${FFPROBE_FIELD_ORDER^^}"
 
-if [[ "$FFPROBE_FIELD_ORDER_UC" == "PROGRESSIVE" ]]; then
+if [[ "$IS_DV_SOURCE" == true ]]; then
+    # DV from FireWire capture is always BFF on NTSC regardless of what
+    # ffprobe reports. The AVI container does not store field order metadata
+    # for DV streams, causing ffprobe to return 'unknown'. We shortcut here
+    # to avoid falling through to the auto-detect path.
+    IS_INTERLACED=true
+    PARITY="1"
+    FIELD_ORDER="BFF (Bottom Field First — DV/NTSC, codec-based detection)"
+
+elif [[ "$FFPROBE_FIELD_ORDER_UC" == "PROGRESSIVE" ]]; then
     IS_INTERLACED=false
     PARITY="-1"
     FIELD_ORDER="Progressive"
@@ -162,7 +218,8 @@ elif [[ "$FFPROBE_FIELD_ORDER_UC" == "BB" || "$FFPROBE_FIELD_ORDER_UC" == "BT" ]
     PARITY="1"
     FIELD_ORDER="BFF (Bottom Field First)"
 else
-    # ffprobe returned 'unknown' or empty — fall back to probe_video.py output
+    # ffprobe returned 'unknown' or empty for a non-DV source.
+    # Fall back to probe_video.py output.
     SCAN_TYPE=$(echo "$PROBE_LOG" | grep "Scan Type:" | awk -F': ' '{print $2}')
     if echo "$PROBE_LOG" | grep -q "Interlaced"; then
         IS_INTERLACED=true
@@ -190,15 +247,17 @@ if echo "$PROBE_LOG" | grep -q "unrealistic"; then
     FFLAGS="-fflags +genpts"
 fi
 
-# 5. Pre-Flight Summary & Confirmation
+# 6. Pre-Flight Summary & Confirmation
 # Summarizes both Video and Audio plans before committing to a long encode.
 echo -e "\n========================================="
 echo "       PRE-FLIGHT SUMMARY$TEST_LABEL"
 echo "========================================="
 echo "Source File:   $SOURCE_INPUT"
+echo "Source Codec:  $SOURCE_CODEC"
 echo "Output File:   $PROG_OUTPUT"
 echo "Audio Plan:    $AUDIO_PLAN"
 echo "Bottom Mask:   ${MASK_PIXELS} pixels"
+echo "CRF:           ${CRF_VALUE}"
 
 if [ "$IS_INTERLACED" = true ]; then
     VIDEO_PLAN="HIGH-QUALITY DEINTERLACING (bwdif) — Field Order: ${FIELD_ORDER}"
@@ -212,13 +271,13 @@ fi
 echo "========================================="
 
 read -p "Do you wish to begin? (y/n): " -n 1 -r
-echo # Move to a new line
+echo
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     echo "Operation cancelled by user."
     exit 0
 fi
 
-# 6. Processing
+# 7. Processing
 if [ "$IS_INTERLACED" = true ]; then
     echo -e "\n--- Step 2: High-Quality Deinterlacing (${FIELD_ORDER}) ---"
 
@@ -231,13 +290,24 @@ if [ "$IS_INTERLACED" = true ]; then
 
     echo "Generating master: $PROG_OUTPUT"
 
-    # -crf 16 and -preset slower prioritize data retention for the subsequent AI upscale.
-    # -field_order progressive prevents subsequent probe hits for interlaced metadata.
-    # -movflags +faststart is MP4-specific but harmless on MKV (ignored silently).
-    ffmpeg -y $FFLAGS -i "$SOURCE_INPUT" $LIMIT_CMD \
+    # ffmpeg argument order notes:
+    #   $LIMIT_CMD (-t 30 in test mode) is placed BEFORE -i so it applies as
+    #   an input option, strictly limiting how much of the source is read.
+    #   Placing it after -i would limit output duration instead, which works
+    #   in practice but is semantically incorrect for --test mode.
+    #
+    #   -threads 0 lets libx264 auto-detect the optimal thread count for the
+    #   host CPU rather than hardcoding a value that may under or over-utilize
+    #   available cores.
+    #
+    #   -crf defaults to 16, suitable for AI upscaling pipeline input.
+    #   Pass --crf 14 or --crf 12 for perceptually lossless archival masters.
+    #   -preset slower prioritizes data retention over encode speed.
+    #
+    #   -movflags +faststart is MP4-specific but harmless on MKV (ignored silently).
+    ffmpeg -y $FFLAGS $LIMIT_CMD -i "$SOURCE_INPUT" \
         -vf "$FILTER_CHAIN" \
-        -c:v libx264 -threads 8 -crf 16 -preset slower \
-        -field_order progressive \
+        -c:v libx264 -threads 0 -crf "$CRF_VALUE" -preset slower \
         -movflags +faststart \
         $AUDIO_CMD \
         "$PROG_OUTPUT"
@@ -247,3 +317,6 @@ else
     echo -e "\n--- Step 2: No Deinterlacing Needed ---"
     echo "Source is progressive. You can use $SOURCE_INPUT directly."
 fi
+
+} # end main
+main "$@"

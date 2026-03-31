@@ -41,14 +41,25 @@ set -uo pipefail
 # ==============================================================================
 # Dependency Preflight
 # Fail early with a clear message rather than a cryptic error mid-capture.
+# stdbuf is handled separately: it is strongly preferred (forces line-buffering
+# so dvgrab's \r-separated records reach awk promptly) but not strictly
+# required — without it, progress output may batch-flush rather than stream.
 # ==============================================================================
-for cmd in dvgrab ffprobe bc gawk stdbuf; do
+for cmd in dvgrab ffprobe bc gawk; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "[ERROR] Required command not found: $cmd"
         echo "        Install it and retry."
         exit 1
     }
 done
+
+if command -v stdbuf >/dev/null 2>&1; then
+    DVGRAB_CMD=(stdbuf -oL dvgrab)
+else
+    echo "[WARNING] stdbuf not found — progress lines may buffer rather than stream."
+    echo "          Install coreutils to suppress this warning."
+    DVGRAB_CMD=(dvgrab)
+fi
 
 # ==============================================================================
 # Configuration
@@ -69,10 +80,14 @@ main() {
 # ==============================================================================
 usage() {
     echo ""
-    echo "Usage: $0 [-o OUTPUT_DIR] <SOURCE_ID> [DESCRIPTION]"
+    echo "Usage: $0 [-o OUTPUT_DIR] [-d DURATION] <SOURCE_ID> [DESCRIPTION]"
     echo ""
     echo "  -o OUTPUT_DIR  Optional. Override the default capture root."
     echo "                 Default: ${CAPTURE_ROOT}"
+    echo "  -d DURATION    Optional. Stop automatically after this duration."
+    echo "                 Format: HH:MM:SS or MM:SS or seconds (e.g. 37:00 or 2220)."
+    echo "                 Useful when you know the source tape length and cannot"
+    echo "                 monitor the capture. dvgrab stops cleanly at the limit."
     echo "  SOURCE_ID      Required. A short unique identifier for the source."
     echo "                 Spaces are allowed and will be converted to underscores."
     echo "  DESCRIPTION    Optional. Additional context appended to the filename."
@@ -81,14 +96,11 @@ usage() {
     echo "  $0 VHS001"
     echo "     -> ${CAPTURE_ROOT}/VHS001_20250319_1430/VHS001_20250319_1430001.avi"
     echo ""
-    echo "  $0 'Home Movies 1992'"
-    echo "     -> ${CAPTURE_ROOT}/Home_Movies_1992_20250319_1430/..."
+    echo "  $0 -d 37:00 VHS001 'Home Movies 1992'"
+    echo "     Stops automatically after 37 minutes."
     echo ""
-    echo "  $0 BOX1_VHS03 'Christmas 1991'"
-    echo "     -> ${CAPTURE_ROOT}/BOX1_VHS03_Christmas_1991_20250319_1430/..."
-    echo ""
-    echo "  $0 -o /tmp/test VHS001 'Summer 1990'"
-    echo "     -> /tmp/test/VHS001_Summer_1990_20250319_1430/..."
+    echo "  $0 -d 1:32:00 BOX1_VHS03 'Christmas 1991'"
+    echo "     Stops automatically after 1 hour 32 minutes."
     echo ""
     echo "PASSTHROUGH WORKFLOW:"
     echo "  1. Connect external VCR A/V out to TRV330 A/V in."
@@ -96,7 +108,8 @@ usage() {
     echo "  3. Cue VCR tape to the desired start point."
     echo "  4. Press PLAY on the VCR."
     echo "  5. Run this script immediately after."
-    echo "  6. Press Ctrl+C to stop capture, then STOP on the VCR."
+    echo "  6. Press Ctrl+C to stop early, or let -d duration stop it automatically."
+    echo "     Then press STOP on the VCR."
     echo ""
     echo "Notes:"
     echo "  - dvgrab cannot send commands to the camera in passthrough mode."
@@ -121,10 +134,21 @@ fi
 # ==============================================================================
 # 1. Argument Parsing
 # ==============================================================================
-while getopts ":o:" opt; do
+CAPTURE_DURATION=""   # empty means no limit; set via -d
+
+while getopts ":o:d:" opt; do
     case $opt in
         o)
             CAPTURE_ROOT="$OPTARG"
+            ;;
+        d)
+            CAPTURE_DURATION="$OPTARG"
+            # Validate: accept HH:MM:SS, MM:SS, or plain seconds
+            if ! echo "$CAPTURE_DURATION" | grep -qE '^([0-9]+:)?[0-9]{1,2}:[0-9]{2}$|^[0-9]+$'; then
+                echo "[ERROR] -d duration must be HH:MM:SS, MM:SS, or seconds (got: $CAPTURE_DURATION)"
+                usage
+                exit 1
+            fi
             ;;
         \?)
             echo "[ERROR] Unknown option: -$OPTARG"
@@ -185,7 +209,10 @@ LOG_FILE="${OUTPUT_DIR}/${BASE_NAME}.log"
 # ==============================================================================
 # 4. Pre-flight: Directory Collision Check
 # ==============================================================================
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR" || {
+    echo "[ERROR] Failed to create output directory: $OUTPUT_DIR"
+    exit 1
+}
 if [ "$(find "$OUTPUT_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
     echo "[WARNING] Output directory is not empty: $OUTPUT_DIR"
     echo "          A previous capture may exist. Continuing will mix files."
@@ -240,17 +267,29 @@ FLAGS=(
                      # the TRV330 is in passthrough mode, not playback mode.
 )
 
+# Add --duration if the user specified -d. dvgrab accepts HH:MM:SS, MM:SS,
+# or plain seconds and stops cleanly at the limit, closing the file properly.
+if [[ -n "$CAPTURE_DURATION" ]]; then
+    FLAGS+=(--duration "$CAPTURE_DURATION")
+fi
+
 echo "---------------------------------------------------------"
 echo ">>> INITIALIZING DVGRAB IN PASSTHROUGH MODE..."
 echo ">>> Capturing incoming signal from TRV330 A/V inputs."
-echo ">>> Press Ctrl+C to stop capture, then STOP on the VCR."
+if [[ -n "$CAPTURE_DURATION" ]]; then
+    echo ">>> Auto-stop after: $CAPTURE_DURATION"
+    echo ">>> Or press Ctrl+C to stop early."
+else
+    echo ">>> Press Ctrl+C to stop capture, then STOP on the VCR."
+fi
 echo "---------------------------------------------------------"
 
 # ==============================================================================
 # 7. Execution & Logging
 # ==============================================================================
 # PROGRESS_INTERVAL_SEC converted to a frame count at NTSC 29.97fps.
-PROGRESS_FRAMES=$(( PROGRESS_INTERVAL_SEC * 2997 / 100 ))
+# Uses exact NTSC ratio 30000/1001 (same as capture_tape.sh).
+PROGRESS_FRAMES=$(( PROGRESS_INTERVAL_SEC * 30000 / 1001 ))
 
 OUTPUT_FILE_PREFIX="$OUTPUT_DIR/${BASE_NAME}"
 
@@ -265,11 +304,12 @@ STALL_TIMEOUT_SEC=15
 #
 # The awk record separator RS="\r" is required because dvgrab --showstatus
 # uses carriage returns to overwrite its status line in place.
-# stdbuf -oL forces line-buffering so records reach awk promptly.
+# DVGRAB_CMD prepends stdbuf -oL when available, forcing line-buffering so
+# records reach awk promptly rather than accumulating in a block buffer.
 #
 # || true ensures the script continues to the Audit even if dvgrab
 # exits non-zero (normal when Ctrl+C is pressed or signal is lost).
-stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
+"${DVGRAB_CMD[@]}" "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
 | awk -v interval="$PROGRESS_FRAMES" \
       -v outfile_prefix="$OUTPUT_FILE_PREFIX" \
       -v stall_sec="$STALL_TIMEOUT_SEC" '
@@ -311,18 +351,26 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
             now         = systime()
 
             # Stall detection: no frame progress for stall_sec seconds.
+            # last_frame_seen >= 0 skips the comparison on the very first
+            # record (before a baseline exists); frame counts start at 0
+            # so -1 can never match, but the guard makes the intent explicit.
+            # == rather than < because frame counts are monotonically
+            # increasing — dvgrab briefly repeats a count at autosplit
+            # boundaries but never goes backwards, so equality is the
+            # correct stall signal and < would never be true in normal use.
+            # The time gate is the outer condition so a transient repeat at
+            # an autosplit boundary does not fire the banner prematurely —
+            # only a sustained stall triggers it.
             # In passthrough mode a stall most likely means signal loss
             # (VCR paused, tape ended, or A/V cable disconnected).
-            if (last_frame_seen >= 0 && frame_count == last_frame_seen) {
-                if (now - last_progress_time >= stall_sec) {
-                    printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-                    printf "!!! WARNING: Signal lost or stalled — no frame progress for ~%ds\n", now - last_progress_time
-                    printf "!!!          Check VCR is still playing and A/V cable is connected.\n"
-                    printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-                    fflush()
-                    last_progress_time = now
-                }
-            } else {
+            if (last_frame_seen >= 0 && frame_count == last_frame_seen && now - last_progress_time >= stall_sec) {
+                printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                printf "!!! WARNING: Signal lost or stalled — no frame progress for ~%ds\n", now - last_progress_time
+                printf "!!!          Check VCR is still playing and A/V cable is connected.\n"
+                printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                fflush()
+                last_progress_time = now
+            } else if (frame_count != last_frame_seen) {
                 last_progress_time = now
             }
             last_frame_seen = frame_count

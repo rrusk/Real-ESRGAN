@@ -3,7 +3,7 @@
 set -e
 
 # ==========================================================
-# encode_dvd_v8_iso.sh
+# encode_dvd_v10_iso.sh
 # One-pass DVD ISO creation with chapters
 #
 # Optimized for:
@@ -25,6 +25,22 @@ if [[ -z "$INPUT" ]]; then
     echo "  --start-time TIME       Trim: start time (e.g. 00:00:05 or 5)"
     echo "  --end-time TIME         Trim: end time (e.g. 01:02:30 or 3750)"
     echo "  --force                 Overwrite existing output files without prompting"
+    echo "  --chapter-file FILE     Path to a chapter definition file. Bypasses scene"
+    echo "                          detection entirely. Times are relative to the ORIGINAL"
+    echo "                          video before any trimming, so your friend can read them"
+    echo "                          directly from VLC without adjustment."
+    echo "                          Format: one chapter per line — time then title, separated"
+    echo "                          by one or more spaces or a tab. Lines starting with #"
+    echo "                          and blank lines are ignored. Do not include the opening"
+    echo "                          chapter at 00:00:00 — it is added automatically."
+    echo "                          Time format: HH:MM:SS or plain seconds."
+    echo "                          Example file contents:"
+    echo "                            # Ballroom Competition Programme"
+    echo "                            00:04:32  Waltz"
+    echo "                            00:11:15  Tango"
+    echo "                            00:19:40  Viennese Waltz"
+    echo "                            00:28:05  Foxtrot"
+    echo "                          If --start-time is set, chapters before it are dropped."
     exit 1
 fi
 
@@ -34,6 +50,7 @@ shift
 # PARSE OPTIONAL ARGS
 # ==============================
 TARGET_CHAPTERS=""
+CHAPTER_FILE=""
 HEAD_SWITCH_PIXELS=8
 SCENE_THRESHOLD="0.40"
 START_TIME=""
@@ -52,6 +69,8 @@ while [[ $# -gt 0 ]]; do
             START_TIME="$2"; shift 2 ;;
         --end-time)
             END_TIME="$2"; shift 2 ;;
+        --chapter-file)
+            CHAPTER_FILE="$2"; shift 2 ;;
         --force)
             FORCE=true; shift ;;
         *)
@@ -72,9 +91,10 @@ MODE="HQ"
 CHAPTER_MODE="HYBRID"     # SCENE | TIME | HYBRID
 MIN_CHAPTER_GAP=240       # seconds; used when TARGET_CHAPTERS is not set
 
-OUTPUT="${INPUT%.*}_dvd.vob"
-DVD_DIR="${INPUT%.*}_dvd"
-ISO_OUT="${INPUT%.*}.iso"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+OUTPUT="${INPUT%.*}_dvd_${TIMESTAMP}.vob"
+DVD_DIR="${INPUT%.*}_dvd_${TIMESTAMP}"
+ISO_OUT="${INPUT%.*}_${TIMESTAMP}.iso"
 
 # ==============================
 # DEPENDENCY CHECK
@@ -94,27 +114,6 @@ check_dep dvdauthor "sudo apt install dvdauthor"
 check_dep genisoimage "sudo apt install genisoimage"
 
 echo "→ All dependencies found."
-
-# ==============================
-# OUTPUT OVERWRITE CHECK
-# ==============================
-confirm_overwrite() {
-    local FILE="$1"
-    if [[ -e "$FILE" ]]; then
-        if [[ "$FORCE" == true ]]; then
-            echo "→ --force: overwriting $FILE"
-        else
-            read -r -p "Output already exists: $FILE — overwrite? [y/N] " REPLY
-            if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
-                echo "Aborting. Use --force to overwrite without prompting."
-                exit 1
-            fi
-        fi
-    fi
-}
-
-confirm_overwrite "$OUTPUT"
-confirm_overwrite "$ISO_OUT"
 
 # ==============================
 echo "=== PROBE ==="
@@ -189,35 +188,85 @@ fi
 # ==============================
 # Interlace detection
 # ==============================
-# -ss before -i for fast input seek; -t limits to the trimmed window.
-# (-to is output-position relative, -t is duration relative — safer here.)
-IDET_DURATION_FLAG=""
-if [[ -n "$START_TIME" || -n "$END_TIME" ]]; then
-    IDET_DURATION_FLAG="-t $(printf "%.0f" "$DURATION")"
-fi
+#
+# Detection priority (mirrors prepare_video.sh):
+#   1. DV codec shortcut — NTSC DV is always BFF per IEC 61834. ffprobe cannot
+#      read field order from AVI container headers for DV streams and returns
+#      'unknown'. The idet filter is also unreliable on DV because the YUV411p
+#      -> YUV420p chroma conversion during decode confuses its field-order
+#      heuristics, causing it to report TFF even though the stream is BFF.
+#      We shortcut here to avoid that incorrect result entirely.
+#   2. ffprobe stream=field_order — reliable for MPEG-2/DVD and most MP4 sources.
+#   3. idet filter fallback — for non-DV sources where ffprobe returns 'unknown'.
 
-IDET_LOG=$(ffmpeg $TRIM_INPUT_FLAGS -i "$INPUT" $IDET_DURATION_FLAG \
-  -vf idet -frames:v 500 -an -f rawvideo -y /dev/null 2>&1)
-
-TFF=$(echo "$IDET_LOG" | grep -oP 'TFF:\s*\K[0-9]+' | head -1)
-BFF=$(echo "$IDET_LOG" | grep -oP 'BFF:\s*\K[0-9]+' | head -1)
-PROG=$(echo "$IDET_LOG" | grep -oP 'Progressive:\s*\K[0-9]+' | head -1)
-
-# Default to 0 if grep found nothing — prevents silent arithmetic failures.
-# If all three are 0 (e.g. idet produced no output), we keep INTERLACED=true
-# and FIELD_ORDER=bff — NTSC DV is bottom field first per IEC 61834, so this
-# is the correct safe default for any TRV330 capture.
-TFF=${TFF:-0}
-BFF=${BFF:-0}
-PROG=${PROG:-0}
+SOURCE_CODEC=$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$INPUT" 2>/dev/null)
 
 FIELD_ORDER="bff"
 INTERLACED=true
 
-if (( PROG > BFF && PROG > TFF )); then
-    INTERLACED=false
-elif (( TFF > BFF )); then
-    FIELD_ORDER="tff"
+if [[ "$SOURCE_CODEC" == dv* ]]; then
+    # DV codec detected — always BFF on NTSC regardless of what any probe reports.
+    # Do not run idet: its field-order result is unreliable for DV due to the
+    # YUV411p->YUV420p chroma subsampling conversion applied during decode.
+    INTERLACED=true
+    FIELD_ORDER="bff"
+    echo "→ DV codec detected ($SOURCE_CODEC) — BFF assumed (NTSC DV, IEC 61834). Skipping idet."
+else
+    # Non-DV source: try ffprobe field_order first.
+    FFPROBE_FIELD_ORDER=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=field_order \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$INPUT" 2>/dev/null)
+    FFPROBE_FIELD_ORDER_UC="${FFPROBE_FIELD_ORDER^^}"
+
+    if [[ "$FFPROBE_FIELD_ORDER_UC" == "PROGRESSIVE" ]]; then
+        INTERLACED=false
+        FIELD_ORDER="bff"   # unused when INTERLACED=false
+        echo "→ Field order: Progressive (from ffprobe)"
+    elif [[ "$FFPROBE_FIELD_ORDER_UC" == "TT" ]]; then
+        INTERLACED=true
+        FIELD_ORDER="tff"
+        echo "→ Field order: TFF (from ffprobe)"
+    elif [[ "$FFPROBE_FIELD_ORDER_UC" == "BB" || "$FFPROBE_FIELD_ORDER_UC" == "BT" ]]; then
+        INTERLACED=true
+        FIELD_ORDER="bff"
+        echo "→ Field order: BFF (from ffprobe)"
+    else
+        # ffprobe returned 'unknown' or empty — fall back to idet.
+        echo "→ ffprobe field_order unknown — running idet on 500 frames..."
+        IDET_DURATION_FLAG=""
+        if [[ -n "$START_TIME" || -n "$END_TIME" ]]; then
+            IDET_DURATION_FLAG="-t $(printf "%.0f" "$DURATION")"
+        fi
+
+        IDET_LOG=$(ffmpeg $TRIM_INPUT_FLAGS -i "$INPUT" $IDET_DURATION_FLAG \
+          -vf idet -frames:v 500 -an -f rawvideo -y /dev/null 2>&1)
+
+        TFF_COUNT=$(echo "$IDET_LOG" | grep -oP 'TFF:\s*\K[0-9]+' | head -1)
+        BFF_COUNT=$(echo "$IDET_LOG" | grep -oP 'BFF:\s*\K[0-9]+' | head -1)
+        PROG_COUNT=$(echo "$IDET_LOG" | grep -oP 'Progressive:\s*\K[0-9]+' | head -1)
+        TFF_COUNT=${TFF_COUNT:-0}
+        BFF_COUNT=${BFF_COUNT:-0}
+        PROG_COUNT=${PROG_COUNT:-0}
+
+        echo "→ idet result: TFF=$TFF_COUNT BFF=$BFF_COUNT Progressive=$PROG_COUNT"
+
+        if (( PROG_COUNT > BFF_COUNT && PROG_COUNT > TFF_COUNT )); then
+            INTERLACED=false
+            echo "→ Field order: Progressive (from idet)"
+        elif (( TFF_COUNT > BFF_COUNT )); then
+            INTERLACED=true
+            FIELD_ORDER="tff"
+            echo "→ Field order: TFF (from idet)"
+        else
+            INTERLACED=true
+            FIELD_ORDER="bff"
+            echo "→ Field order: BFF (from idet)"
+        fi
+    fi
 fi
 
 # ==============================
@@ -289,8 +338,47 @@ if [[ "$INTERLACED" = true ]]; then
 fi
 
 # ==============================
+# PRE-FLIGHT SUMMARY & CONFIRMATION
+# ==============================
+echo ""
+echo "========================================="
+echo "         PRE-FLIGHT SUMMARY"
+echo "========================================="
+echo "  Input:        $INPUT"
+echo "  ISO output:   $ISO_OUT"
+echo "  Duration:     ${DURATION}s"
+echo "  Video:        $BITRATE (max $MAXRATE)"
+echo "  SAR:          $RAW_SAR"
+echo "  Head-switch:  ${HEAD_SWITCH_PIXELS}px masked"
+echo "  Mode:         $MODE"
+if [[ "$INTERLACED" = true ]]; then
+    echo "  Field order:  ${FIELD_ORDER^^} (interlaced, -top $([ \"$FIELD_ORDER\" == \"tff\" ] && echo 1 || echo 0))"
+else
+    echo "  Field order:  Progressive"
+fi
+if [[ -n "$START_TIME" || -n "$END_TIME" ]]; then
+    echo "  Trim:         ${START_TIME:-start} -> ${END_TIME:-end}"
+fi
+if [[ -n "$CHAPTER_FILE" ]]; then
+    echo "  Chapters:     from $CHAPTER_FILE"
+fi
+echo "========================================="
+echo ""
+read -r -p "Do you wish to begin encoding? [y/N] " REPLY
+echo
+if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+    echo "Aborting."
+    exit 0
+fi
+
+# ==============================
 # ENCODE
 # ==============================
+if [[ "$INTERLACED" = true ]]; then
+    echo "→ Encoding interlaced MPEG-2: field order = ${FIELD_ORDER^^}, -top $([ "$FIELD_ORDER" == "tff" ] && echo 1 || echo 0)"
+else
+    echo "→ Encoding progressive MPEG-2 (no interlace flags)"
+fi
 echo "=== ENCODING ==="
 
 ffmpeg $TRIM_INPUT_FLAGS -i "$INPUT" $TRIM_OUTPUT_FLAGS \
@@ -317,70 +405,155 @@ ffmpeg $TRIM_INPUT_FLAGS -i "$INPUT" $TRIM_OUTPUT_FLAGS \
 # ==============================
 echo "=== CHAPTERS ==="
 
-# Derive time chapter interval from target chapter count if provided
-if [[ -n "$TARGET_CHAPTERS" ]] && (( TARGET_CHAPTERS > 1 )); then
-    TIME_CHAPTER_INTERVAL=$(( DURATION_INT / TARGET_CHAPTERS ))
-    echo "→ Target chapters: $TARGET_CHAPTERS → interval: ${TIME_CHAPTER_INTERVAL}s"
-else
-    TIME_CHAPTER_INTERVAL=600
-fi
-
-generate_scene_times() {
-    TMP=$(mktemp)
-
-    ffmpeg $TRIM_INPUT_FLAGS -i "$INPUT" $IDET_DURATION_FLAG \
-      -filter:v "select='gt(scene,${SCENE_THRESHOLD})',showinfo" \
-      -vsync vfr -f null - 2>&1 | \
-      grep pts_time | \
-      grep -oP 'pts_time:\K[0-9\.]+' > "$TMP"
-
-    LAST=0
-    TIMES="0"
-
-    # Use TARGET_CHAPTERS-derived gap if available, else MIN_CHAPTER_GAP
-    if [[ -n "$TARGET_CHAPTERS" ]] && (( TARGET_CHAPTERS > 1 )); then
-        EFFECTIVE_GAP=$(( DURATION_INT / TARGET_CHAPTERS ))
-    else
-        EFFECTIVE_GAP=$MIN_CHAPTER_GAP
+if [[ -n "$CHAPTER_FILE" ]]; then
+    # --chapter-file supplied: read times and titles from file.
+    # Times are relative to the original video — subtract START_SEC to make
+    # them trim-relative for dvdauthor. Chapter titles are passed via a
+    # dvdauthor XML file so they are embedded in the IFO as proper DVD chapter
+    # names (readable by VLC and most standalone players).
+    if [[ ! -f "$CHAPTER_FILE" ]]; then
+        echo "[ERROR] Chapter file not found: $CHAPTER_FILE"
+        exit 1
     fi
 
-    while read TIME; do
-        if (( $(echo "$TIME - $LAST > $EFFECTIVE_GAP" | bc -l) )); then
-            SEC=$(printf "%.0f" "$TIME")
-            TIMES="$TIMES,$SEC"
-            LAST=$TIME
+    echo "→ Reading chapters from: $CHAPTER_FILE (trim offset: ${START_SEC}s)"
+
+    # Build parallel arrays: adjusted time in seconds, and title strings.
+    CHAPTER_TIMES="0"
+    CHAPTER_TITLES=()
+    CHAPTER_TITLES+=("Introduction")   # title for the auto-added chapter 0
+    LINE_NUM=0
+    PARSE_ERRORS=0
+
+    while IFS= read -r LINE; do
+        LINE_NUM=$(( LINE_NUM + 1 ))
+
+        # Strip leading whitespace, skip blank lines and comments
+        LINE=$(echo "$LINE" | sed 's/^[[:space:]]*//')
+        [[ -z "$LINE" || "$LINE" == \#* ]] && continue
+
+        # Split on first run of whitespace: first token = time, rest = title
+        TIME_TOKEN=$(echo "$LINE" | awk '{print $1}')
+        TITLE_TOKEN=$(echo "$LINE" | sed 's/^[^[:space:]]*[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+        # Validate time token format: must be HH:MM:SS, MM:SS, or plain integer/decimal
+        if ! [[ "$TIME_TOKEN" =~ ^[0-9]{1,2}:[0-9]{2}:[0-9]{2}$ ||
+                "$TIME_TOKEN" =~ ^[0-9]{1,2}:[0-9]{2}$ ||
+                "$TIME_TOKEN" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "[ERROR] Line $LINE_NUM: invalid time format '${TIME_TOKEN}'"
+            echo "        Expected HH:MM:SS, MM:SS, or seconds. Full line: $LINE"
+            PARSE_ERRORS=$(( PARSE_ERRORS + 1 ))
+            continue
         fi
-    done < "$TMP"
 
-    rm "$TMP"
-    echo "$TIMES"
-}
+        # Validate title is not empty
+        if [[ -z "$TITLE_TOKEN" || "$TITLE_TOKEN" == "$TIME_TOKEN" ]]; then
+            echo "[ERROR] Line $LINE_NUM: missing chapter title after time '${TIME_TOKEN}'"
+            PARSE_ERRORS=$(( PARSE_ERRORS + 1 ))
+            continue
+        fi
 
-generate_time_times() {
-    TIMES="0"
-    i=$TIME_CHAPTER_INTERVAL
+        ENTRY_SEC=$(to_seconds "$TIME_TOKEN")
+        ADJUSTED=$(echo "$ENTRY_SEC - $START_SEC" | bc -l)
 
-    while (( i < DURATION_INT )); do
-        TIMES="$TIMES,$i"
-        i=$(( i + TIME_CHAPTER_INTERVAL ))
-    done
+        if (( $(echo "$ADJUSTED > 0" | bc -l) )) && (( $(echo "$ADJUSTED < $DURATION" | bc -l) )); then
+            CHAPTER_TIMES="$CHAPTER_TIMES,$(printf "%.0f" "$ADJUSTED")"
+            CHAPTER_TITLES+=("$TITLE_TOKEN")
+            echo "  + $(printf "%.0f" "$ADJUSTED")s — $TITLE_TOKEN"
+        else
+            echo "  ⚠ Skipping '$TIME_TOKEN' (${ENTRY_SEC}s) — outside trimmed window"
+        fi
+    done < "$CHAPTER_FILE"
 
-    echo "$TIMES"
-}
-
-if [[ "$CHAPTER_MODE" == "SCENE" ]]; then
-    CHAPTER_TIMES=$(generate_scene_times)
-elif [[ "$CHAPTER_MODE" == "TIME" ]]; then
-    CHAPTER_TIMES=$(generate_time_times)
-else
-    CHAPTER_TIMES=$(generate_scene_times)
-
-    COUNT=$(echo "$CHAPTER_TIMES" | tr -cd ',' | wc -c)
-
-    if (( COUNT < 2 )); then
-        echo "→ Fallback to time-based chapters"
-        CHAPTER_TIMES=$(generate_time_times)
+    # Abort if any parse errors were found — force the user to fix the file
+    if (( PARSE_ERRORS > 0 )); then
+        echo ""
+        echo "[ERROR] $PARSE_ERRORS error(s) found in $CHAPTER_FILE — aborting."
+        echo "        Please correct the file and re-run."
+        exit 1
     fi
+
+    # Abort if no chapters were successfully parsed beyond the automatic chapter 0
+    CHAPTER_COUNT=$(echo "$CHAPTER_TIMES" | tr -cd ',' | wc -c)
+    if (( CHAPTER_COUNT < 1 )); then
+        echo ""
+        echo "[ERROR] No valid chapters were loaded from $CHAPTER_FILE."
+        echo "        Check that times are within the video duration"
+        if [[ -n "$START_TIME" || -n "$END_TIME" ]]; then
+            echo "        and within the trimmed window (${START_TIME:-start} → ${END_TIME:-end})."
+        fi
+        exit 1
+    fi
+
+    USE_CHAPTER_TITLES=true
+else
+    # Auto-detect chapters via scene detection or time intervals.
+    # Derive time chapter interval from target chapter count if provided
+    if [[ -n "$TARGET_CHAPTERS" ]] && (( TARGET_CHAPTERS > 1 )); then
+        TIME_CHAPTER_INTERVAL=$(( DURATION_INT / TARGET_CHAPTERS ))
+        echo "→ Target chapters: $TARGET_CHAPTERS → interval: ${TIME_CHAPTER_INTERVAL}s"
+    else
+        TIME_CHAPTER_INTERVAL=600
+    fi
+
+    generate_scene_times() {
+        TMP=$(mktemp)
+
+        ffmpeg $TRIM_INPUT_FLAGS -i "$INPUT" $IDET_DURATION_FLAG \
+          -filter:v "select='gt(scene,${SCENE_THRESHOLD})',showinfo" \
+          -vsync vfr -f null - 2>&1 | \
+          grep pts_time | \
+          grep -oP 'pts_time:\K[0-9\.]+' > "$TMP"
+
+        LAST=0
+        TIMES="0"
+
+        # Use TARGET_CHAPTERS-derived gap if available, else MIN_CHAPTER_GAP
+        if [[ -n "$TARGET_CHAPTERS" ]] && (( TARGET_CHAPTERS > 1 )); then
+            EFFECTIVE_GAP=$(( DURATION_INT / TARGET_CHAPTERS ))
+        else
+            EFFECTIVE_GAP=$MIN_CHAPTER_GAP
+        fi
+
+        while read TIME; do
+            if (( $(echo "$TIME - $LAST > $EFFECTIVE_GAP" | bc -l) )); then
+                SEC=$(printf "%.0f" "$TIME")
+                TIMES="$TIMES,$SEC"
+                LAST=$TIME
+            fi
+        done < "$TMP"
+
+        rm "$TMP"
+        echo "$TIMES"
+    }
+
+    generate_time_times() {
+        TIMES="0"
+        i=$TIME_CHAPTER_INTERVAL
+
+        while (( i < DURATION_INT )); do
+            TIMES="$TIMES,$i"
+            i=$(( i + TIME_CHAPTER_INTERVAL ))
+        done
+
+        echo "$TIMES"
+    }
+
+    if [[ "$CHAPTER_MODE" == "SCENE" ]]; then
+        CHAPTER_TIMES=$(generate_scene_times)
+    elif [[ "$CHAPTER_MODE" == "TIME" ]]; then
+        CHAPTER_TIMES=$(generate_time_times)
+    else
+        CHAPTER_TIMES=$(generate_scene_times)
+
+        COUNT=$(echo "$CHAPTER_TIMES" | tr -cd ',' | wc -c)
+
+        if (( COUNT < 2 )); then
+            echo "→ Fallback to time-based chapters"
+            CHAPTER_TIMES=$(generate_time_times)
+        fi
+    fi
+    USE_CHAPTER_TITLES=false
 fi
 
 echo "→ Chapter times: $CHAPTER_TIMES"
@@ -393,6 +566,9 @@ echo "=== AUTHORING DVD ==="
 rm -rf "$DVD_DIR"
 mkdir -p "$DVD_DIR"
 
+# Note: dvdauthor/DVD-Video IFO files do not support chapter title strings.
+# Chapter positions are embedded correctly. The titles from the chapter
+# file are saved for use with mkvtoolnix on the MKV archive.
 VIDEO_FORMAT=NTSC dvdauthor -o "$DVD_DIR" -t -c "$CHAPTER_TIMES" "$OUTPUT"
 VIDEO_FORMAT=NTSC dvdauthor -o "$DVD_DIR" -T
 
@@ -413,3 +589,13 @@ echo "→ Removed: $DVD_DIR"
 echo
 echo "=== DONE ==="
 echo "ISO ready: $ISO_OUT"
+if [[ -n "$CHAPTER_FILE" ]]; then
+    echo ""
+    echo "Chapter titles from $CHAPTER_FILE:"
+    for i in "${!CHAPTER_TITLES[@]}"; do
+        echo "  Chapter $((i+1)): ${CHAPTER_TITLES[$i]}"
+    done
+    echo ""
+    echo "→ To embed these titles in your MKV archive, use mkvtoolnix-gui"
+    echo "  or mkvpropedit: https://mkvtoolnix.download/doc/mkvpropedit.html"
+fi

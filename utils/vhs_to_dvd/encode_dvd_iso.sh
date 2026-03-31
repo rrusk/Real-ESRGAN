@@ -283,29 +283,47 @@ DURATION_INT=$(printf "%.0f" "$DURATION")
 # ==============================
 # Dynamic bitrate ceiling
 # ==============================
-# Single-sided DVD capacity: 4,700,000,000 bytes = 37,600,000,000 bits
-# Reserve audio: 192,000 bps * duration
-# Reserve DVD overhead: ~3% of total capacity
-# Remaining bits / duration = max video bitrate
-# Clamp to [2000k, 8000k] per DVD spec
+# Single-sided DVD-5 capacity: 4,700,000,000 bytes = 37,600,000,000 bits
+# DVD-Video spec maximum programme stream: 9,800 kbps total
+#   (video + audio + mux overhead must not exceed this)
+# We reserve:
+#   - 192 kbps  for AC-3 audio
+#   - 200 kbps  for mux overhead (nav packs, PTS/DTS, pack headers)
+#   → video ceiling = 9,400 kbps
+#
+# Bitrate is calculated two ways and the lower result is used:
+#   1. Disc-fill rate: spread the full usable disc capacity over the duration.
+#      No separate overhead fraction here — the stream ceiling already accounts
+#      for mux overhead, so deducting it again from disc capacity would be
+#      double-counting and would leave disc space needlessly unused.
+#   2. Stream ceiling: 9800 - audio - safety
+#      (ensures the MPEG-2 programme stream stays within spec)
+# Clamped to [2000k, stream_ceiling].
 
 DVD_CAPACITY_BITS=37600000000
-OVERHEAD_FRACTION=0.03
 AUDIO_BITRATE_BPS=192000
+MAX_TOTAL_BPS=9800000
+SAFETY_BPS=200000
+
+# Derived stream ceiling (kbps integer used in ffmpeg -maxrate flag)
+VIDEO_STREAM_CEILING_BPS=$(( MAX_TOTAL_BPS - AUDIO_BITRATE_BPS - SAFETY_BPS ))
+VIDEO_STREAM_CEILING_K=$(( VIDEO_STREAM_CEILING_BPS / 1000 ))
 
 MAX_VIDEO_BPS=$(echo "
     scale=0;
-    available = $DVD_CAPACITY_BITS * (1 - $OVERHEAD_FRACTION) - ($AUDIO_BITRATE_BPS * $DURATION);
-    bps = available / $DURATION;
-    if (bps > 8000000) bps = 8000000;
+    available = $DVD_CAPACITY_BITS - ($AUDIO_BITRATE_BPS * $DURATION);
+    disc_bps = available / $DURATION;
+    stream_ceiling = $VIDEO_STREAM_CEILING_BPS;
+    bps = disc_bps;
+    if (bps > stream_ceiling) bps = stream_ceiling;
     if (bps < 2000000) bps = 2000000;
     bps / 1000
 " | bc)
 
 BITRATE="${MAX_VIDEO_BPS}k"
-MAXRATE="8000k"
+MAXRATE="${VIDEO_STREAM_CEILING_K}k"
 
-echo "→ Calculated video bitrate: $BITRATE (duration: ${DURATION}s)"
+echo "→ Calculated video bitrate: $BITRATE (duration: ${DURATION}s, stream ceiling: ${MAXRATE})"
 
 # ==============================
 # Filters
@@ -347,7 +365,7 @@ echo "========================================="
 echo "  Input:        $INPUT"
 echo "  ISO output:   $ISO_OUT"
 echo "  Duration:     ${DURATION}s"
-echo "  Video:        $BITRATE (max $MAXRATE)"
+echo "  Video:        $BITRATE (stream ceiling ${MAXRATE})"
 echo "  SAR:          $RAW_SAR"
 echo "  Head-switch:  ${HEAD_SWITCH_PIXELS}px masked"
 echo "  Mode:         $MODE"

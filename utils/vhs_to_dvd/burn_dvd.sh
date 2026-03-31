@@ -87,15 +87,19 @@ read -r -p "Insert a blank DVD and press Enter when ready, or Ctrl+C to abort...
 # ==============================
 echo ""
 echo "=== BURNING ==="
-echo "→ Running: growisofs -dvd-compat -speed=4 -Z ${DEVICE}=${ISO}"
+echo "→ Running: growisofs -dvd-compat -speed=4 -use-the-force-luke=notray -Z ${DEVICE}=${ISO}"
 echo ""
 
-growisofs -dvd-compat -speed=4 -Z "${DEVICE}=${ISO}"
+# -use-the-force-luke=notray suppresses the automatic tray eject that growisofs
+# performs after finalising the disc. Without it the drive ejects and must be
+# manually reloaded before verification, which also leaves the tray exposed.
+growisofs -dvd-compat -speed=4 -use-the-force-luke=notray -Z "${DEVICE}=${ISO}"
 
 echo ""
 echo "=== BURN COMPLETE ==="
 echo ""
-echo "The drive is reloading the tray. Once it has settled, verify the burn with:"
+echo "Disc has been finalised. The tray was not ejected."
+echo "Verify the burn whenever you are ready with:"
 echo "  ./verify_dvd.sh \"$ISO\""
 echo ""
 echo "=== DONE ==="

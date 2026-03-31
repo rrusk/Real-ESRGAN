@@ -8,7 +8,7 @@ set -euo pipefail
 #
 # Usage: ./verify_dvd.sh <isofile>
 #
-# Run this after burn_dvd.sh once the drive tray has fully reloaded.
+# Run this after burn_dvd.sh.
 # ==============================================================================
 
 # ==============================
@@ -18,7 +18,7 @@ if [[ -z "${1:-}" ]]; then
     echo "Usage: $0 <isofile>"
     echo ""
     echo "  Compares the MD5 of the source ISO against the disc currently"
-    echo "  in the drive. Run after burn_dvd.sh once the tray has reloaded."
+    echo "  in the drive."
     exit 1
 fi
 
@@ -43,6 +43,7 @@ check_dep() {
 check_dep isosize "sudo apt install util-linux"
 check_dep md5sum  "sudo apt install coreutils"
 check_dep dd      "sudo apt install coreutils"
+check_dep eject   "sudo apt install eject"
 
 # ==============================
 # DETECT DVD DRIVE
@@ -73,9 +74,26 @@ echo "→ ISO file:   $ISO"
 echo ""
 
 # ==============================
+# USER PROMPT: EJECT / RELOAD
+# ==============================
+echo "Before verification, the disc should be freshly loaded."
+read -r -p "Eject and reload the DVD now? [Y/n] " REPLY
+REPLY=${REPLY:-Y}
+
+if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+    echo "→ Ejecting tray..."
+    eject "$DEVICE" || true
+    echo "→ Please reinsert/close the tray, then press Enter to continue..."
+    read -r
+else
+    echo "→ Skipping eject/reload at user request."
+fi
+
+# ==============================
 # WAIT FOR MEDIUM
 # ==============================
 # Poll until the drive reports a readable medium, with a timeout.
+echo ""
 echo "→ Waiting for disc to be ready..."
 MAX_WAIT=60
 WAITED=0

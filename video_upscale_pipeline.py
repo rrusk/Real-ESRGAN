@@ -359,6 +359,16 @@ Examples:
   %(prog)s video.avi --profile dv            # optimised for MiniDV/Digital8/DV AVI sources
   %(prog)s video.avi --profile hi8dv         # Hi8 tape via Digital8/FireWire direct capture
   %(prog)s camcorder.mp4                     # works with DV, Hi8, and other camcorder formats
+  %(prog)s video.avi --model realesr-general-x4v3   # use general degradation model at 2x output
+  %(prog)s video.avi -s 4 --model realesr-general-x4v3  # general model at 4x output
+
+ESRGAN models (--model):
+  RealESRGAN_x2plus        Default for --scale 2. Trained for 2x output in one step.
+  RealESRGAN_x4plus        Default for --scale 4. More parameters, strong 4x detail.
+  realesr-general-x4v3     General degradation model (noise, blur, compression artifacts).
+                           Internally always 4x; downsamples to 2x when --scale 2 is used.
+                           The downsampling acts as a natural anti-aliasing pass, which can
+                           suit noisy VHS/Hi8 sources better than RealESRGAN_x2plus.
 
 Pre-filter profiles (--profile):
   balanced   Default. Hi8/S-Video capture -> DVD (~4.6Mbps).   hqdn3d=2:2:6:6,     pp=fd, unsharp=3:3:0.2
@@ -375,7 +385,7 @@ Pre-filter profiles (--profile):
         type=int, 
         choices=[2, 4], 
         default=2, 
-        help="Upscale factor: 2 (for RealESRGAN_x2plus) or 4 (for RealESRGAN_x4plus). Default: 2"
+        help="Upscale factor: 2 or 4. Default: 2. Controls output resolution. Default model per scale: 2=RealESRGAN_x2plus, 4=RealESRGAN_x4plus. Override with --model."
     )
     parser.add_argument(
         "--threads",
@@ -399,6 +409,19 @@ Pre-filter profiles (--profile):
             "halo:       White ghost lines around dark edges. Heavy denoise, fast deblock, minimal sharpen. "
             "dv:         MiniDV/Digital8/DV AVI. Lighter denoise, stronger deblock+dering, gentle sharpen. "
             "hi8dv:      Hi8 tape via Digital8/FireWire (DV capture). No MPEG-2 artifacts; moderate temporal denoise, full deblock+dering."
+        )
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        metavar="MODEL_NAME",
+        help=(
+            "Override the default ESRGAN model (default: RealESRGAN_x2plus for --scale 2, "
+            "RealESRGAN_x4plus for --scale 4). "
+            "Example: --model realesr-general-x4v3. "
+            "The model name must match the .pth filename in the weights/ directory (without extension). "
+            "Note: realesr-general-x4v3 is always a 4x model internally; when used with --scale 2 "
+            "it upscales to 4x then downsamples to 2x, which can reduce over-hallucination on noisy sources."
         )
     )
     parser.add_argument(
@@ -498,13 +521,17 @@ def main(args):
         print(f"Error: Input video not found at: {INPUT_VIDEO}")
         sys.exit(1)
 
-    if SCALE_FACTOR == 2:
+    if args.model:
+        REALSRGAN_MODEL = args.model
+        print(f"[INFO] ESRGAN model overridden via --model: {REALSRGAN_MODEL}")
+    elif SCALE_FACTOR == 2:
         REALSRGAN_MODEL = "RealESRGAN_x2plus"
     elif SCALE_FACTOR == 4:
         REALSRGAN_MODEL = "RealESRGAN_x4plus"
     
     input_basename = os.path.splitext(os.path.basename(INPUT_VIDEO))[0]
-    FINAL_VIDEO_FILE = os.path.join(OUTPUT_DIR, f"{input_basename}_x{SCALE_FACTOR}_rife_FINAL.mkv")
+    MODEL_SHORT = {"RealESRGAN_x2plus": "x2plus", "RealESRGAN_x4plus": "x4plus", "realesr-general-x4v3": "gen-x4v3"}.get(REALSRGAN_MODEL, REALSRGAN_MODEL)
+    FINAL_VIDEO_FILE = os.path.join(OUTPUT_DIR, f"{input_basename}_{profile}_x{SCALE_FACTOR}_{MODEL_SHORT}.mkv")
     ORIGINAL_AUDIO_FILE = os.path.join(PROCESSING_DIR, f"{input_basename}_original.mka")  # .mka accepts any codec (AC-3, AAC, PCM, MP3)
     ORIGINAL_AUDIO_FILE_MP3 = os.path.join(PROCESSING_DIR, f"{input_basename}_original.mp3")  # fallback path
 
@@ -520,6 +547,7 @@ def main(args):
         "input_video": os.path.abspath(INPUT_VIDEO),
         "scale_factor": SCALE_FACTOR,
         "profile": profile,
+        "model": REALSRGAN_MODEL,
     }
     
     if os.path.exists(metadata_file):

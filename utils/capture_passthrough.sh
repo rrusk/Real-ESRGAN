@@ -1,8 +1,21 @@
 #!/bin/bash
 # ==============================================================================
-# Script Name: capture_passthrough.sh v1 - Analog Passthrough Ingest
+# Script Name: capture_passthrough.sh v2 - Analog Passthrough Ingest
 # Optimized for: Sony DCR-TRV330 acting as FireWire bridge for external VCR
 # Source: VHS (or any analog source connected to the TRV330's A/V inputs)
+# ==============================================================================
+# CHANGE LOG:
+#   v2 -- Applied three fixes from capture_tape.sh v32/v33/v34:
+#         - v32 subline fix: awk now splits each \r-record on \n and processes
+#           sublines independently. Fixes progress output stopping after the
+#           first autosplit segment (e.g. after a VCR pause causes signal loss).
+#         - v33 stat quoting: bitrate stat command wrapped in sh -c so shell
+#           handles glob expansion safely when OUTPUT_DIR contains spaces.
+#         - v34 multi-file audit: integrity audit now loops all AVI files with
+#           per-file [OK]/[!!!]/[???] flags and a combined total summary,
+#           instead of examining only the last file.
+#
+#   v1 -- Initial release.
 # ==============================================================================
 # PASSTHROUGH MODE NOTES:
 #
@@ -321,102 +334,123 @@ STALL_TIMEOUT_SEC=15
         capture_start_time = systime()
     }
     {
-        line = $0
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-        if (line == "") next
+        # RS="\r" splits on carriage returns before any rule runs.
+        # Each record may still contain \n-embedded sublines: dvgrab
+        # emits a \n-terminated filename announcement when opening a new
+        # autosplit segment, mixed into the otherwise \r-delimited stream.
+        # This creates a single \r-record containing two logical lines
+        # joined by \n. Processing $0 as a blob causes the frame-count
+        # regex to miss the status portion, stopping progress output for
+        # the rest of the capture. Split each record into sublines and
+        # handle each one independently to avoid this.
+        n = split($0, sublines, "\n")
+        for (i = 1; i <= n; i++) {
+            line = sublines[i]
 
-        # Critical and lifecycle lines — pass through with banners for errors.
-        if (line ~ /(damaged|missing|invalid|[Ee]rror|Warning:|Autosplit|Capture Start|Capture Stop)/) {
-            if (line ~ /(damaged|missing|invalid|[Ee]rror|Warning:)/) {
-                if (!(line in warned)) {
-                    warned[line] = 1
-                    print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-                    print "!!! " line
-                    print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            # Strip control characters (including BEL 0x07) and whitespace.
+            gsub(/[\x00-\x1F]/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            if (line == "") continue
+
+            # Critical and lifecycle lines — pass through with banners for errors.
+            if (line ~ /(damaged|missing|invalid|[Ee]rror|Warning:|Autosplit|Capture Start|Capture Stop)/) {
+                if (line ~ /(damaged|missing|invalid|[Ee]rror|Warning:)/) {
+                    if (!(line in warned)) {
+                        warned[line] = 1
+                        print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                        print "!!! " line
+                        print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                        fflush()
+                    }
+                } else {
+                    print line; fflush()
+                }
+                continue
+            }
+
+            # Progress lines: track frame count, apply stall detection and
+            # interval sampling. Display elapsed wall-clock capture time
+            # rather than frame-derived tape position — in passthrough mode
+            # the two should match but elapsed time is more meaningful since
+            # there is no tape position reference from the source VCR.
+            if (match(line, /([0-9]+)[[:space:]]+frames/, m)) {
+                frame_count = m[1]
+                now         = systime()
+
+                # Stall detection: no frame progress for stall_sec seconds.
+                # last_frame_seen >= 0 skips the comparison on the very first
+                # record (before a baseline exists); frame counts start at 0
+                # so -1 can never match, but the guard makes the intent explicit.
+                # == rather than < because frame counts are monotonically
+                # increasing — dvgrab briefly repeats a count at autosplit
+                # boundaries but never goes backwards, so equality is the
+                # correct stall signal and < would never be true in normal use.
+                # The time gate is the outer condition so a transient repeat at
+                # an autosplit boundary does not fire the banner prematurely —
+                # only a sustained stall triggers it.
+                # In passthrough mode a stall most likely means signal loss
+                # (VCR paused, tape ended, or A/V cable disconnected).
+                if (last_frame_seen >= 0 && frame_count == last_frame_seen && now - last_progress_time >= stall_sec) {
+                    printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                    printf "!!! WARNING: Signal lost or stalled — no frame progress for ~%ds\n", now - last_progress_time
+                    printf "!!!          Check VCR is still playing and A/V cable is connected.\n"
+                    printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
                     fflush()
+                    last_progress_time = now
+                } else if (frame_count != last_frame_seen) {
+                    last_progress_time = now
                 }
-            } else {
-                print line; fflush()
-            }
-            next
-        }
+                last_frame_seen = frame_count
 
-        # Progress lines: track frame count, apply stall detection and
-        # interval sampling. Display elapsed wall-clock capture time
-        # rather than frame-derived tape position — in passthrough mode
-        # the two should match but elapsed time is more meaningful since
-        # there is no tape position reference from the source VCR.
-        if (match(line, /([0-9]+)[[:space:]]+frames/, m)) {
-            frame_count = m[1]
-            now         = systime()
+                # Sample at interval, always print first line.
+                if (last_printed < 0 || frame_count - last_printed >= interval) {
 
-            # Stall detection: no frame progress for stall_sec seconds.
-            # last_frame_seen >= 0 skips the comparison on the very first
-            # record (before a baseline exists); frame counts start at 0
-            # so -1 can never match, but the guard makes the intent explicit.
-            # == rather than < because frame counts are monotonically
-            # increasing — dvgrab briefly repeats a count at autosplit
-            # boundaries but never goes backwards, so equality is the
-            # correct stall signal and < would never be true in normal use.
-            # The time gate is the outer condition so a transient repeat at
-            # an autosplit boundary does not fire the banner prematurely —
-            # only a sustained stall triggers it.
-            # In passthrough mode a stall most likely means signal loss
-            # (VCR paused, tape ended, or A/V cable disconnected).
-            if (last_frame_seen >= 0 && frame_count == last_frame_seen && now - last_progress_time >= stall_sec) {
-                printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-                printf "!!! WARNING: Signal lost or stalled — no frame progress for ~%ds\n", now - last_progress_time
-                printf "!!!          Check VCR is still playing and A/V cable is connected.\n"
-                printf "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-                fflush()
-                last_progress_time = now
-            } else if (frame_count != last_frame_seen) {
-                last_progress_time = now
-            }
-            last_frame_seen = frame_count
+                    # Elapsed capture time from this script'\''s start (wall clock).
+                    elapsed_sec = now - capture_start_time
+                    h   = int(elapsed_sec / 3600)
+                    m_  = int((elapsed_sec % 3600) / 60)
+                    s   = elapsed_sec % 60
 
-            # Sample at interval, always print first line.
-            if (last_printed < 0 || frame_count - last_printed >= interval) {
+                    # Real-time bitrate from cumulative size of ALL segment files.
+                    # Wrapped in sh -c so the shell handles glob expansion safely
+                    # even when OUTPUT_DIR contains spaces (v33 fix).
+                    bitrate_mbps = "N/A"
+                    if (elapsed_sec > 5) {
+                        filesize = 0
+                        cmd = "sh -c 'stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null'"
+                        while ((cmd | getline sz) > 0) filesize += sz
+                        close(cmd)
+                        if (filesize > 0)
+                            bitrate_mbps = sprintf("%.2f", (filesize * 8) / elapsed_sec / 1000000)
+                    }
 
-                # Elapsed capture time from this script'\''s start (wall clock).
-                elapsed_sec = now - capture_start_time
-                h   = int(elapsed_sec / 3600)
-                m_  = int((elapsed_sec % 3600) / 60)
-                s   = elapsed_sec % 60
+                    # Strip the timecode and date fields from the status line.
+                    # In passthrough mode these are today'\''s wall-clock values
+                    # from the TRV330 — they are not original recording dates
+                    # and add no useful information for the operator.
+                    clean = line
+                    gsub(/ timecode [^ ]+/, "", clean)
+                    gsub(/ date [0-9]+\.[0-9]+\.[0-9]+ [0-9:]+/, "", clean)
 
-                # Real-time bitrate from cumulative size of ALL segment files.
-                bitrate_mbps = "N/A"
-                if (elapsed_sec > 5) {
-                    filesize = 0
-                    cmd = "stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null"
-                    while ((cmd | getline sz) > 0) filesize += sz
-                    close(cmd)
-                    if (filesize > 0)
-                        bitrate_mbps = sprintf("%.2f", (filesize * 8) / elapsed_sec / 1000000)
+                    printf "[ELAPSED %d:%02d:%02d | %s Mbps] %s\n", h, m_, s, bitrate_mbps, clean
+                    fflush()
+                    last_printed = frame_count
                 }
-
-                # Strip the timecode and date fields from the status line.
-                # In passthrough mode these are today'\''s wall-clock values
-                # from the TRV330 — they are not original recording dates
-                # and add no useful information for the operator.
-                clean = line
-                gsub(/ timecode [^ ]+/, "", clean)
-                gsub(/ date [0-9]+\.[0-9]+\.[0-9]+ [0-9:]+/, "", clean)
-
-                printf "[ELAPSED %d:%02d:%02d | %s Mbps] %s\n", h, m_, s, bitrate_mbps, clean
-                fflush()
-                last_printed = frame_count
+                continue
             }
-            next
-        }
 
-        # Pass through everything else (device init messages, etc.)
-        print line; fflush()
+            # Pass through everything else (device init messages, etc.)
+            print line; fflush()
+        }
     }
 ' | tee "$LOG_FILE" || true
 
 # ==============================================================================
 # 8. Post-Capture Integrity Audit
+# ==============================================================================
+# Passthrough captures are normally a single file, but dvgrab will autosplit
+# on signal loss (VCR pause, tape end, cable hiccup). We audit every file so
+# that a corrupted first segment is never silently skipped.
 # ==============================================================================
 printf '\a'
 echo "---------------------------------------------------------"
@@ -435,65 +469,105 @@ if [ "${#AVI_FILES[@]}" -eq 0 ]; then
     exit 1
 fi
 
-LATEST_FILE=$(ls -t -- "${AVI_FILES[@]}" | head -1)
+TOTAL_DURATION_SEC=0
+TOTAL_SIZE_BYTES=0
+WARN_COUNT=0
+FFPROBE_FALLBACK_NOTED=0
 
-if [ -f "$LATEST_FILE" ]; then
+{
+    echo "DATA INTEGRITY AUDIT: $BASE_NAME"
+    echo "Generated: $(date)"
+    echo "Files: ${#AVI_FILES[@]}"
+    echo "---------------------------------------------------------"
 
-    STATS=$(ffprobe -v error -show_entries format=duration,bit_rate \
-        -of default=noprint_wrappers=1 "$LATEST_FILE" 2>&1 \
-        | grep -E '^(duration|bit_rate)')
+    for AVI_FILE in $(printf '%s\n' "${AVI_FILES[@]}" | sort); do
 
-    BITRATE=$(echo "$STATS" | grep "^bit_rate" | cut -d= -f2 || echo "N/A")
-    DURATION=$(echo "$STATS" | grep "^duration" | cut -d= -f2 || echo "0")
+        STATS=$(ffprobe -v error -show_entries format=duration,bit_rate \
+            -of default=noprint_wrappers=1 "$AVI_FILE" 2>&1 \
+            | grep -E '^(duration|bit_rate)')
 
-    BITRATE="${BITRATE:-N/A}"
-    DURATION="${DURATION:-0}"
+        BITRATE=$(echo "$STATS" | grep "^bit_rate" | cut -d= -f2 || echo "N/A")
+        DURATION=$(echo "$STATS" | grep "^duration" | cut -d= -f2 || echo "0")
 
-    if [[ "$BITRATE" == "N/A" || "$BITRATE" == "0" ]]; then
-        if [[ "$DURATION" == "0" || "$DURATION" == "N/A" ]]; then
-            echo "[WARNING] Could not determine duration or bitrate. File may be empty." | tee -a "$LOG_FILE"
-            BITRATE_MBPS="0"
-        else
-            FILE_SIZE=$(stat -c%s "$LATEST_FILE")
-            BITRATE=$(echo "scale=0; ($FILE_SIZE * 8) / $DURATION" | bc)
-            BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
-            echo "[INFO] Bitrate calculated from file size (ffprobe returned N/A — normal for DV/AVI)." | tee -a "$LOG_FILE"
-        fi
-    else
-        BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
-    fi
+        BITRATE="${BITRATE:-N/A}"
+        DURATION="${DURATION:-0}"
 
-    if [[ "$BITRATE_MBPS" != "0" ]]; then
-        DURATION_INT=${DURATION%.*}
-        DURATION_HMS=$(printf '%d:%02d:%02d' \
-            $((DURATION_INT / 3600)) \
-            $(((DURATION_INT % 3600) / 60)) \
-            $((DURATION_INT % 60)))
+        FILE_SIZE=$(stat -c%s "$AVI_FILE")
+        TOTAL_SIZE_BYTES=$(( TOTAL_SIZE_BYTES + FILE_SIZE ))
 
-        {
-            echo "DATA INTEGRITY AUDIT: $BASE_NAME"
-            echo "Generated: $(date)"
-            echo "---------------------------------------------------------"
-            echo "File:     $(basename "$LATEST_FILE")"
-            echo "Duration: ${DURATION_HMS} (${DURATION}s)"
-            echo "Bitrate:  ${BITRATE_MBPS} Mbps"
-            # DV NTSC standard is ~25 Mbps video + ~1.5 Mbps PCM audio = ~28.5 Mbps total.
-            # Below 28.0 Mbps suggests dropped frames or a degraded passthrough signal.
-            if (( $(echo "$BITRATE_MBPS < 28.0" | bc -l) )); then
-                echo "[!!!] WARNING: Low bitrate. Check $LOG_FILE for dropped frames."
-                echo "      In passthrough mode this may indicate a weak A/V input signal"
-                echo "      or a TRV330 not fully in passthrough mode."
+        # Guard: ffprobe often returns N/A for bit_rate on DV/AVI containers.
+        # Fall back to manual calculation from file size and duration.
+        if [[ "$BITRATE" == "N/A" || "$BITRATE" == "0" ]]; then
+            if [[ "$DURATION" == "0" || "$DURATION" == "N/A" ]]; then
+                BITRATE_MBPS="0"
             else
-                echo "[SUCCESS] High-integrity capture confirmed."
+                BITRATE=$(echo "scale=0; ($FILE_SIZE * 8) / $DURATION" | bc)
+                BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
+                if [[ "$FFPROBE_FALLBACK_NOTED" -eq 0 ]]; then
+                    echo "[INFO] Bitrate calculated from file size (ffprobe returned N/A — normal for DV/AVI)."
+                    FFPROBE_FALLBACK_NOTED=1
+                fi
             fi
-            echo "---------------------------------------------------------"
-            echo "NOTE: Timecodes in the DV stream are today's wall-clock time"
-            echo "      (generated by the TRV330 during A/V conversion)."
-            echo "      They are NOT original recording dates from the source tape."
-            echo "---------------------------------------------------------"
-        } | tee -a "$LOG_FILE"
+        else
+            BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
+        fi
+
+        if [[ "$DURATION" != "0" && "$DURATION" != "N/A" ]]; then
+            DURATION_INT=${DURATION%.*}
+            TOTAL_DURATION_SEC=$(( TOTAL_DURATION_SEC + DURATION_INT ))
+            DURATION_HMS=$(printf '%d:%02d:%02d' \
+                $((DURATION_INT / 3600)) \
+                $(((DURATION_INT % 3600) / 60)) \
+                $((DURATION_INT % 60)))
+        else
+            DURATION_HMS="?"
+        fi
+
+        # DV NTSC standard is ~25 Mbps video + ~1.5 Mbps PCM audio = ~28.5 Mbps total.
+        # Below 28.0 Mbps suggests dropped frames or a degraded passthrough signal.
+        if [[ "$BITRATE_MBPS" == "0" ]]; then
+            printf "  [???] %-45s  duration=%-9s  bitrate=unknown\n" \
+                "$(basename "$AVI_FILE")" "$DURATION_HMS"
+            (( WARN_COUNT++ )) || true
+        elif (( $(echo "$BITRATE_MBPS < 28.0" | bc -l) )); then
+            printf "  [!!!] %-45s  duration=%-9s  bitrate=%s Mbps  LOW\n" \
+                "$(basename "$AVI_FILE")" "$DURATION_HMS" "$BITRATE_MBPS"
+            (( WARN_COUNT++ )) || true
+        else
+            printf "  [OK]  %-45s  duration=%-9s  bitrate=%s Mbps\n" \
+                "$(basename "$AVI_FILE")" "$DURATION_HMS" "$BITRATE_MBPS"
+        fi
+    done
+
+    echo "---------------------------------------------------------"
+
+    TOTAL_HMS=$(printf '%d:%02d:%02d' \
+        $((TOTAL_DURATION_SEC / 3600)) \
+        $(((TOTAL_DURATION_SEC % 3600) / 60)) \
+        $((TOTAL_DURATION_SEC % 60)))
+    TOTAL_GiB=$(echo "scale=2; $TOTAL_SIZE_BYTES / 1073741824" | bc)
+    if [[ "$TOTAL_DURATION_SEC" -gt 0 ]]; then
+        OVERALL_MBPS=$(echo "scale=2; ($TOTAL_SIZE_BYTES * 8) / $TOTAL_DURATION_SEC / 1000000" | bc)
+    else
+        OVERALL_MBPS="N/A"
     fi
-fi
+
+    echo "Total duration: ${TOTAL_HMS}  |  Total size: ${TOTAL_GiB} GiB  |  Overall bitrate: ${OVERALL_MBPS} Mbps"
+    echo ""
+    if [[ "$WARN_COUNT" -eq 0 ]]; then
+        echo "[SUCCESS] All ${#AVI_FILES[@]} file(s) passed integrity check."
+    else
+        echo "[!!!] WARNING: ${WARN_COUNT} file(s) flagged above. Check $LOG_FILE for dropped frames."
+        echo "      In passthrough mode low bitrate may indicate a weak A/V input signal"
+        echo "      or a TRV330 not fully in passthrough mode."
+    fi
+    echo "---------------------------------------------------------"
+    echo "NOTE: Timecodes in the DV stream are today's wall-clock time"
+    echo "      (generated by the TRV330 during A/V conversion)."
+    echo "      They are NOT original recording dates from the source tape."
+    echo "---------------------------------------------------------"
+
+} | tee -a "$LOG_FILE"
 
 echo "---------------------------------------------------------"
 echo "Done."

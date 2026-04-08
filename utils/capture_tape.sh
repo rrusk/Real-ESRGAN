@@ -226,14 +226,15 @@ fi
 if [[ "$TAPE_TYPE" == "dv" ]]; then
     # Digital8: --timestamp names each file using the filming date embedded
     # in the DV stream so files sort chronologically by when content was filmed.
-    # --size 0 is omitted so dvgrab can split on timecode discontinuities,
-    # producing one file per recording session on the tape.
+    # --size 0 disables 1GB size-based splitting while preserving autosplit
+    # on timecode discontinuities and signal loss.
     FLAGS=(
         --format dv1     # Type 1 AVI -- matches existing Digital8 captures
                          # for checksum comparison. dv1 stores a single
                          # integrated DV track (vs dv2 which adds a separate
                          # audio track). Use dv2 if compatibility with other
                          # tools is needed.
+        --size 0         # allow files >1GB
         --timestamp      # Name files using embedded DV recording date
         --autosplit      # Split on signal loss or timecode jumps
         --opendml        # Support files >4GB

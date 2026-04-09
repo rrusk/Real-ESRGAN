@@ -269,7 +269,9 @@ fi
 # 6. Flag Configuration
 # ==============================================================================
 FLAGS=(
-    --format dv2     # Type 2 AVI (standard for FFmpeg/AI pipeline)
+    --format dv1     # Type 1 AVI: single interleaved DV stream (audio embedded).
+                     # More compact than dv2 but has reduced tool compatibility —
+                     # verify your downstream tools (FFmpeg, NLE) support Type 1.
     --size 0         # Single large file; no size-based splitting
     --autosplit      # Split on signal loss (e.g. VCR pause or tape end)
     --opendml        # Support files >4GB

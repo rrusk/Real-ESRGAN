@@ -497,7 +497,7 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
                     bitrate_mbps = "N/A"
                     if (total_sec > 5) {
                         filesize = 0
-                        cmd = "sh -c 'stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null'"
+                        cmd = "sh -c '\''stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null'\''"
                         while ((cmd | getline sz) > 0) filesize += sz
                         close(cmd)
                         if (filesize > 0)

@@ -1,10 +1,13 @@
 #!/bin/bash
 # ==============================================================================
-# Script Name: capture_passthrough.sh v2 - Analog Passthrough Ingest
+# Script Name: capture_passthrough.sh v3 - Analog Passthrough Ingest
 # Optimized for: Sony DCR-TRV330 acting as FireWire bridge for external VCR
 # Source: VHS (or any analog source connected to the TRV330's A/V inputs)
 # ==============================================================================
 # CHANGE LOG:
+#   v3 -- Changed --format dv2 to --format dv1 (single integrated DV track)
+#         to avoid the audio sync drift caused by dv2's separate audio track.
+#
 #   v2 -- Applied three fixes from capture_tape.sh v32/v33/v34:
 #         - v32 subline fix: awk now splits each \r-record on \n and processes
 #           sublines independently. Fixes progress output stopping after the
@@ -269,9 +272,8 @@ fi
 # 6. Flag Configuration
 # ==============================================================================
 FLAGS=(
-    --format dv1     # Type 1 AVI: single interleaved DV stream (audio embedded).
-                     # More compact than dv2 but has reduced tool compatibility —
-                     # verify your downstream tools (FFmpeg, NLE) support Type 1.
+    --format dv1     # Type 1 AVI -- single integrated DV track avoids
+                     # the audio sync drift seen with dv2's separate track
     --size 0         # Single large file; no size-based splitting
     --autosplit      # Split on signal loss (e.g. VCR pause or tape end)
     --opendml        # Support files >4GB

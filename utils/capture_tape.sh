@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Script Name: capture_tape.sh v33
+# Script Name: capture_tape.sh v36
 # Optimized for: Sony DCR-TRV330 (Hi8/Digital8) & LSI FireWire Chipsets
 # ==============================================================================
 # CONFIGURATION REQUIRED:
@@ -12,6 +12,15 @@
 # ==============================================================================
 #
 # CHANGE LOG:
+#   v36 -- Added --size 0 to Digital8 (dv) flags. Previously omitted on the
+#          assumption that --autosplit would handle all splits, but dvgrab's
+#          default 1GB size limit was still active and would split files
+#          mid-segment regardless of timecode boundaries. --size 0 disables
+#          size-based splitting; --autosplit continues to handle timecode
+#          discontinuities as intended.
+#
+#   v35 -- Changed Hi8 and Digital8 modes to --format dv1 in all cases.
+#
 #   v34 -- Fixed integrity audit examining only the last AVI file. Now loops
 #          over all segment files in chronological order, reports per-file
 #          duration and bitrate with [OK]/[!!!]/[???] flags, and prints a
@@ -288,15 +297,16 @@ fi
 if [[ "$TAPE_TYPE" == "dv" ]]; then
     # Digital8: --timestamp names each file using the filming date embedded
     # in the DV stream so files sort chronologically by when content was filmed.
-    # --size 0 disables 1GB size-based splitting while preserving autosplit
-    # on timecode discontinuities and signal loss.
+    # --autosplit splits on timecode discontinuities, producing one file per
+    # recording session. --size 0 is required to suppress dvgrab's default
+    # 1GB size limit, which would otherwise split files mid-segment regardless
+    # of timecode boundaries.
     FLAGS=(
-        --format dv1     # Type 1 AVI -- matches existing Digital8 captures
-                         # for checksum comparison. dv1 stores a single
-                         # integrated DV track (vs dv2 which adds a separate
-                         # audio track). Use dv2 if compatibility with other
-                         # tools is needed.
-        --size 0         # allow files >1GB
+        --format dv1     # Type 1 AVI -- single integrated DV track avoids
+                         # the audio sync drift seen with dv2's separate track.
+                         # Use dv2 only if downstream tool compatibility requires it.
+        --size 0         # Disable 1GB size-based splitting; let --autosplit
+                         # handle splits on timecode discontinuities only
         --timestamp      # Name files using embedded DV recording date
         --autosplit      # Split on signal loss or timecode jumps
         --opendml        # Support files >4GB
@@ -307,7 +317,8 @@ else
     # Hi8 analog: no valid internal timecodes, so use a single large file
     # named with the capture session date.
     FLAGS=(
-        --format dv2
+        --format dv1     # Type 1 AVI -- single integrated DV track avoids
+                         # the audio sync drift seen with dv2's separate track
         --size 0         # Single large file; no size-based splitting
         --autosplit      # Split ONLY on signal loss or timecode jumps
         --opendml        # Support files >4GB (essential for 120min tapes)
@@ -497,7 +508,7 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
                     bitrate_mbps = "N/A"
                     if (total_sec > 5) {
                         filesize = 0
-                        cmd = "sh -c '\''stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null'\''"
+                        cmd = "sh -c 'stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null'"
                         while ((cmd | getline sz) > 0) filesize += sz
                         close(cmd)
                         if (filesize > 0)

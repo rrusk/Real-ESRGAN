@@ -4,6 +4,7 @@
 import subprocess
 import os
 import shutil
+import shlex
 import json
 import math
 import glob
@@ -438,10 +439,16 @@ def main(args):
     # --- 0. Pre-Flight Checks ---
     check_venv()
 
+    # Capture invocation command for resume messages (shell-safe)
+    RECONSTRUCTED_CMD = " ".join(shlex.quote(arg) for arg in sys.argv)
+
+
     # Enable tee logging from the very start (captures all startup messages)
     sys.stdout = TeeLogger(LOG_FILE)
     print(f"\n--- Pipeline started {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')} | Logging to {LOG_FILE} ---\n")
-    
+    print(f"[INFO] Invocation command:")
+    print(f"  {RECONSTRUCTED_CMD}\n")
+
     # --- 1. Set up variables based on args ---
     INPUT_VIDEO = args.input_video
     SCALE_FACTOR = args.scale
@@ -981,6 +988,8 @@ def main(args):
                     print(f"\n  ⏸️  GRACEFUL SHUTDOWN: Would exceed {max_runtime_hours}h runtime limit.")
                     print(f"    Processed {i+1}/{total_chunks} chunks successfully.")
                     print(f"    Resume anytime - script will continue from chunk {i+1}.")
+                    print(f"    Run the following command to resume:")
+                    print(f"      {RECONSTRUCTED_CMD}")
                     # Remove any STOP file so it doesn't interfere with the next run
                     if os.path.exists(STOP_FILE):
                         os.remove(STOP_FILE)
@@ -999,6 +1008,8 @@ def main(args):
             print(f"\n  ⏸️  GRACEFUL STOP: '{STOP_FILE}' detected.")
             print(f"    Finished chunk {i+1}/{total_chunks}.")
             print(f"    Resume anytime — script will continue from chunk {i+1}.")
+            print(f"    Run the following command to resume:")
+            print(f"      {RECONSTRUCTED_CMD}")
             break
 
     # --- Step 3: Concatenate All Processed Chunks ---
@@ -1019,7 +1030,8 @@ def main(args):
     # Check if all chunks are complete before attempting final concatenation
     if total_processed_chunks < total_chunks:
         print(f"\n⚠️  Incomplete processing: {total_processed_chunks}/{total_chunks} chunks complete.")
-        print(f"   Run the script again to resume from chunk {total_processed_chunks}.")
+        print(f"   Run the following command to resume from chunk {total_processed_chunks}:")
+        print(f"     {RECONSTRUCTED_CMD}")
         print(f"   Final video will be created once all {total_chunks} chunks are processed.")
         sys.exit(0)
 

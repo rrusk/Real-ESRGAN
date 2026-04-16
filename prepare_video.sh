@@ -25,7 +25,7 @@ fi
 # 1. Argument Check
 # Validates input count and provides detailed help documentation.
 if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
-    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N]"
+    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N] [--mode1]"
     echo ""
     echo "Arguments:"
     echo "  source_video    Path to the raw AVI, MPG, or MP4 file."
@@ -41,6 +41,12 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "                  Lower = higher quality and larger file."
     echo "                  12-14 recommended for permanent archival masters."
     echo "                  16 is the default and suits AI upscaling pipeline input."
+    echo "  --mode1         (Optional) Use bwdif mode=1 (field-rate output: ~60fps)."
+    echo "                  Default is mode=0 (frame-rate output: ~30fps)."
+    echo "                  Use when you want to preserve full temporal resolution from"
+    echo "                  interlaced sources (one progressive frame per field)."
+    echo "                  Output filename will include '_60fps' to distinguish from"
+    echo "                  mode=0 masters. Pair with --no-rife in video_upscale_pipeline.py."
     echo ""
     echo "How to select mask_pixels:"
     echo "  1. Play your video in VLC and look at the bottom edge."
@@ -51,9 +57,9 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
 fi
 
 # Strict argument limit check as per previous versions
-if [ "$#" -gt 6 ]; then
+if [ "$#" -gt 7 ]; then
     echo "Error: Too many arguments."
-    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N]"
+    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N] [--mode1]"
     exit 1
 fi
 
@@ -67,6 +73,7 @@ MASK_PIXELS=0
 TEST_MODE=false
 FORCE_AAC=false
 CRF_VALUE=16
+BWDIF_MODE=0   # default: frame-rate output (~30fps); --mode1 sets this to 1 (~60fps)
 
 # Simple parsing loop to handle optional numeric mask and named flags.
 # Because SOURCE_INPUT has been shifted out, only genuine optional args remain.
@@ -83,6 +90,8 @@ for arg in "$@"; do
         TEST_MODE=true
     elif [[ "$arg" == "--aac" ]]; then
         FORCE_AAC=true
+    elif [[ "$arg" == "--mode1" ]]; then
+        BWDIF_MODE=1
     fi
 done
 
@@ -111,12 +120,20 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 OUTPUT_DIR="outputs"
 mkdir -p "$OUTPUT_DIR"
 
+# Embed fps label in filename when mode=1 so 30fps and 60fps masters can
+# coexist in the outputs directory without overwriting each other.
+if [ "$BWDIF_MODE" -eq 1 ]; then
+    FPS_LABEL="_60fps"
+else
+    FPS_LABEL=""
+fi
+
 if [ "$TEST_MODE" = true ]; then
-    PROG_OUTPUT="${OUTPUT_DIR}/${FILE_STEM}_mask${MASK_PIXELS}_TEST.mp4"
+    PROG_OUTPUT="${OUTPUT_DIR}/${FILE_STEM}_mask${MASK_PIXELS}${FPS_LABEL}_TEST.mp4"
     LIMIT_CMD="-t 30"
     TEST_LABEL=" (TEST MODE: 30s)"
 else
-    PROG_OUTPUT="${OUTPUT_DIR}/${FILE_STEM}_mask${MASK_PIXELS}_${TIMESTAMP}.mp4"
+    PROG_OUTPUT="${OUTPUT_DIR}/${FILE_STEM}_mask${MASK_PIXELS}${FPS_LABEL}_${TIMESTAMP}.mp4"
     LIMIT_CMD=""
     TEST_LABEL=""
 fi
@@ -260,10 +277,17 @@ echo "Bottom Mask:   ${MASK_PIXELS} pixels"
 echo "CRF:           ${CRF_VALUE}"
 
 if [ "$IS_INTERLACED" = true ]; then
-    VIDEO_PLAN="HIGH-QUALITY DEINTERLACING (bwdif) — Field Order: ${FIELD_ORDER}"
+    if [ "$BWDIF_MODE" -eq 1 ]; then
+        VIDEO_PLAN="HIGH-QUALITY DEINTERLACING (bwdif mode=1, field-rate ~60fps) — Field Order: ${FIELD_ORDER}"
+    else
+        VIDEO_PLAN="HIGH-QUALITY DEINTERLACING (bwdif mode=0, frame-rate ~30fps) — Field Order: ${FIELD_ORDER}"
+    fi
     echo "Video Plan:    $VIDEO_PLAN"
     echo -e "\n⚠️  WARNING: Deinterlacing is a CPU-intensive process."
     echo "    Depending on video length, this will take quite awhile."
+    if [ "$BWDIF_MODE" -eq 1 ]; then
+        echo "    NOTE: mode=1 output is ~60fps. Use --no-rife in video_upscale_pipeline.py."
+    fi
 else
     VIDEO_PLAN="Progressive Copy (No deinterlacing needed)"
     echo "Video Plan:    $VIDEO_PLAN"
@@ -281,8 +305,12 @@ fi
 if [ "$IS_INTERLACED" = true ]; then
     echo -e "\n--- Step 2: High-Quality Deinterlacing (${FIELD_ORDER}) ---"
 
-    # Filter Chain: bwdif mode=0 (29.97i -> 29.97p), yuv420p format, and optional drawbox.
-    FILTER_CHAIN="bwdif=mode=0:parity=${PARITY}:deint=0,format=yuv420p"
+    # Filter Chain: bwdif mode=$BWDIF_MODE, yuv420p format, and optional drawbox.
+    #   mode=0 (default): frame-rate output — one progressive frame per interlaced frame (~30fps).
+    #   mode=1 (--mode1): field-rate output — one progressive frame per field (~60fps).
+    #                     Preserves full temporal resolution; pair with --no-rife in the
+    #                     upscale pipeline to avoid accidental 120fps output.
+    FILTER_CHAIN="bwdif=mode=${BWDIF_MODE}:parity=${PARITY}:deint=0,format=yuv420p"
     if [ "$MASK_PIXELS" -gt 0 ]; then
         echo "Applying mask: Bottom $MASK_PIXELS pixels"
         FILTER_CHAIN="${FILTER_CHAIN},drawbox=y=ih-${MASK_PIXELS}:h=${MASK_PIXELS}:color=black:t=fill"

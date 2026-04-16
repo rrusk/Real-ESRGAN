@@ -1,53 +1,42 @@
 #!/bin/bash
 # ==============================================================================
-# Script Name: capture_tape.sh v36
+# Script Name: capture_tape.sh v38
 # Optimized for: Sony DCR-TRV330 (Hi8/Digital8) & LSI FireWire Chipsets
 # ==============================================================================
-# CONFIGURATION REQUIRED:
-# Set CAPTURE_ROOT to the absolute path where captured files will be stored.
-# This directory must exist and be writable before running this script.
-# Example: /mnt/video_capture/avi/captures
-# Do NOT use relative paths (./captures) as dvgrab will fail to create files.
+# CONFIGURATION:
+# CAPTURE_ROOT defaults to ~/dv_captures, which can be a symlink to wherever
+# your video storage actually lives. This works on any machine for any user.
+#
+# To set up on a new machine:
+#   ln -s /path/to/actual/storage ~/dv_captures
+#
+# Examples:
+#   Mac Mini:  ln -s /mnt/video_capture/avi/captures ~/dv_captures
+#   Desktop:   ln -s /media/rrusk/videodrive/captures ~/dv_captures
+#
 # Override at runtime with: -o /path/to/output
+# Do NOT use relative paths (./captures) as dvgrab will fail to create files.
 # ==============================================================================
 #
 # CHANGE LOG:
-#   v36 -- Added --size 0 to Digital8 (dv) flags. Previously omitted on the
-#          assumption that --autosplit would handle all splits, but dvgrab's
-#          default 1GB size limit was still active and would split files
-#          mid-segment regardless of timecode boundaries. --size 0 disables
-#          size-based splitting; --autosplit continues to handle timecode
-#          discontinuities as intended.
+#   v38 -- DV mode: progress lines show timecode, filename, and cumulative MiB.
+#          Bitrate removed from per-frame progress; reported once at segment
+#          close (>>> SEGMENT DONE) using stat on the closed file for exact
+#          size. NEW SEGMENT announcements replaced by SEGMENT DONE.
+#          Date analysis reads filming dates from AVI filenames instead of
+#          log parsing; no year filter needed (DV stream dates are trustworthy).
+#          Session header (version, date) written to log after user confirms.
+#          awk pipeline uses tee -a to preserve the session header.
 #
-#   v35 -- Changed Hi8 and Digital8 modes to --format dv1 in all cases.
-#
-#   v34 -- Fixed integrity audit examining only the last AVI file. Now loops
-#          over all segment files in chronological order, reports per-file
-#          duration and bitrate with [OK]/[!!!]/[???] flags, and prints a
-#          combined total duration, size, and overall bitrate at the end.
-#          The ffprobe N/A fallback note is emitted once rather than per file.
-#          Date analysis was already correct -- it reads the log, which is
-#          fully populated now that the v32 subline fix is in place.
-#
-#   v33 -- Fixed awk stat glob quoting. The bitrate calculation used:
-#            stat -c%s "prefix"*.avi
-#          which breaks when OUTPUT_DIR contains spaces because the quote
-#          boundary prevented shell glob expansion. Now wrapped in sh -c:
-#            sh -c 'stat -c%s "prefix"*.avi'
-#          so the shell handles glob expansion inside a properly quoted string.
-#
-#   v32 -- Merge of v18 (production) + v31 awk subline fix.
-#          The awk record splitter now iterates over \n-delimited sublines
-#          within each \r-delimited dvgrab record. This fixes progress output
-#          stopping after the first AVI segment closes: dvgrab emits a
-#          newline-terminated filename announcement mixed into its \r stream,
-#          which in v18 caused the frame-count regex to miss the next record
-#          and silently stop updating last_printed. No other behaviour changed.
+#   v37 -- CAPTURE_ROOT defaults to ~/dv_captures (symlink-friendly, portable).
+#          Validation detects broken symlinks and offers to create the directory
+#          on first run. mkdir -p no longer treated as fatal if dir exists.
+#   v36 -- DV mode: added --size 0 to prevent 1GB mid-segment splits.
+#   v35 -- All modes: --format dv1 (dv2 causes audio sync drift).
+#   v34 -- Audit loops all AVI files; per-file [OK]/[!!!] flags; totals.
+#   v32 -- Fixed progress stopping after first DV segment (awk subline split).
 #          Improved usage/help with concrete filename examples.
-#
-#   v18 -- Stable production release. RS="\r" awk filter, stall detection,
-#          real-time bitrate, Hi8 valid-timecode warning, integrity audit,
-#          recording date analysis.
+#   v18 -- Initial production release.
 # ==============================================================================
 #
 # NOTE: The entire script body is wrapped in main() and called at the bottom.
@@ -74,7 +63,9 @@ done
 # Configuration
 # Placed outside main() so they are visible to usage() help text at any point.
 # ==============================================================================
-CAPTURE_ROOT="/mnt/video_capture/avi/captures"
+# Default capture root. Use a symlink to point this at actual storage:
+#   ln -s /path/to/actual/storage ~/dv_captures
+CAPTURE_ROOT="${HOME}/dv_captures"
 
 # How often to emit a progress line to the console and log during capture.
 # This is used to bracket damaged-frame warnings with an approximate tape
@@ -162,9 +153,10 @@ usage() {
     echo "  - After capture, all unique recording dates found on the tape are"
     echo "    reported. Garbage timecodes outside 1980-2010 are filtered out."
     echo ""
-    echo "IMPORTANT: Default CAPTURE_ROOT is hardcoded in this script as:"
-    echo "  ${CAPTURE_ROOT}"
-    echo "  Edit the CAPTURE_ROOT variable at the top of the script to change it."
+    echo "IMPORTANT: Default CAPTURE_ROOT is: ${CAPTURE_ROOT}"
+    echo "  This can be a symlink to your actual storage location:"
+    echo "    ln -s /path/to/actual/storage ~/dv_captures"
+    echo "  Or override at runtime with: -o /path/to/output"
     echo ""
 }
 
@@ -217,10 +209,32 @@ EXTRA_DESC="${2:-}"
 # ==============================================================================
 # 2. Validate CAPTURE_ROOT
 # ==============================================================================
+if [ ! -e "$CAPTURE_ROOT" ]; then
+    # Resolve what ~/dv_captures should point to before prompting, so the
+    # message is useful whether it is a plain directory or a broken symlink.
+    echo "[WARNING] CAPTURE_ROOT does not exist: $CAPTURE_ROOT"
+    if [ -L "$CAPTURE_ROOT" ]; then
+        echo "          This is a broken symlink. Fix it with:"
+        echo "            ln -sf /path/to/actual/storage $CAPTURE_ROOT"
+        exit 1
+    fi
+    read -p "          Create it now? (y/n): " _CREATE
+    if [[ "$_CREATE" =~ ^[Yy]$ ]]; then
+        mkdir -p "$CAPTURE_ROOT" || {
+            echo "[ERROR] Failed to create: $CAPTURE_ROOT"
+            exit 1
+        }
+        echo "[INFO] Created: $CAPTURE_ROOT"
+        echo "       Consider making this a symlink to your actual storage:"
+        echo "         rmdir $CAPTURE_ROOT"
+        echo "         ln -s /path/to/actual/storage $CAPTURE_ROOT"
+    else
+        echo "Aborted. Create the directory or symlink and retry."
+        exit 1
+    fi
+fi
 if [ ! -d "$CAPTURE_ROOT" ]; then
-    echo "[ERROR] CAPTURE_ROOT does not exist: $CAPTURE_ROOT"
-    echo "        Create it with: mkdir -p $CAPTURE_ROOT"
-    echo "        Or specify a different path with: -o /path/to/output"
+    echo "[ERROR] CAPTURE_ROOT exists but is not a directory: $CAPTURE_ROOT"
     exit 1
 fi
 if [ ! -w "$CAPTURE_ROOT" ]; then
@@ -278,7 +292,7 @@ if ! ls /dev/fw* &>/dev/null && ! ls /dev/raw1394 &>/dev/null; then
 fi
 
 echo "========================================================="
-echo "ARCHIVAL INGEST: $BASE_NAME"
+echo "ARCHIVAL INGEST: $BASE_NAME  [capture_tape.sh v38]"
 echo "Output:  $OUTPUT_DIR"
 echo "---------------------------------------------------------"
 echo "CHECKLIST:"
@@ -290,6 +304,16 @@ if [[ ! "$PROCEED" =~ ^[Yy]$ ]]; then
     echo "Capture aborted by user."
     exit 2
 fi
+
+# Write session header to log now that the user has confirmed capture.
+# The awk pipeline appends to this file via tee -a.
+{
+    echo "capture_tape.sh v38"
+    echo "Session: $BASE_NAME"
+    echo "Started: $(date)"
+    echo "Tape type: $TAPE_TYPE"
+    echo "---------------------------------------------------------"
+} > "$LOG_FILE"
 
 # ==============================================================================
 # 6. Flag Configuration (Bash Array)
@@ -400,6 +424,7 @@ STALL_TIMEOUT_SEC=120
 stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
 | awk -v interval="$PROGRESS_FRAMES" \
       -v outfile_prefix="$OUTPUT_FILE_PREFIX" \
+      -v output_dir="$OUTPUT_DIR" \
       -v stall_sec="$STALL_TIMEOUT_SEC" \
       -v tape_type="$TAPE_TYPE" '
     BEGIN {
@@ -407,8 +432,13 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
         last_printed        = -1
         last_frame_seen     = -1
         last_progress_time  = systime()
+        capture_start_time  = systime()
         hi8_valid_tc_warned = 0
         last_fname          = ""
+        prev_segments_mib   = 0
+        last_size_mib       = 0
+        segment_start_time  = 0   # wall clock when current segment opened
+        segment_start_mib   = 0   # prev_segments_mib at start of current segment
     }
     {
         # RS="\r" splits on carriage returns before any rule runs.
@@ -451,9 +481,77 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
                         fflush()
                     }
                 } else {
+                    # Emit closing segment summary before Capture Stop message
+                    if (tape_type == "dv" && line ~ /Capture Stop/ && last_fname != "") {
+                        seg_elapsed = now - segment_start_time
+                        seg_path = output_dir "/" last_fname
+                        seg_bytes = 0
+                        cmd = "stat -c%s \"" seg_path "\" 2>/dev/null"
+                        if ((cmd | getline seg_bytes) > 0 && seg_bytes > 0) {
+                            seg_mib = sprintf("%.2f", seg_bytes / 1048576)
+                            if (seg_elapsed > 0)
+                                seg_mbps = sprintf("%.2f", (seg_bytes * 8) / seg_elapsed / 1000000)
+                            else
+                                seg_mbps = "N/A"
+                        } else {
+                            seg_mib = last_size_mib
+                            seg_mbps = "N/A"
+                        }
+                        close(cmd)
+                        print ">>> SEGMENT DONE: " last_fname " | " seg_mib " MiB | " seg_mbps " Mbps"
+                        fflush()
+                    }
                     print line; fflush()
                 }
                 continue
+            }
+
+            # ------------------------------------------------------------------
+            # For Digital8: detect when dvgrab opens a new segment file due to
+            # autosplit and announce it clearly so the operator knows a new
+            # recording session has started on the tape.
+            # This check runs before the frame-count check so that a line
+            # containing both a filename and a frame count (which dvgrab emits
+            # on the very first frame of a new segment) correctly announces the
+            # new file AND is then also processed for progress below.
+            # ------------------------------------------------------------------
+            if (tape_type == "dv" && line ~ /\.avi":/) {
+                fname = line
+                gsub(/.*\//, "", fname)
+                gsub(/".*/, "", fname)
+                if (fname != last_fname && fname != "") {
+                    if (last_fname != "") {
+                        # The previous segment file is now fully closed.
+                        # Use stat on the exact filename for accurate final size,
+                        # and wall-clock time since that segment opened for duration.
+                        seg_elapsed = now - segment_start_time
+                        seg_path = output_dir "/" last_fname
+                        seg_bytes = 0
+                        cmd = "stat -c%s \"" seg_path "\" 2>/dev/null"
+                        if ((cmd | getline seg_bytes) > 0 && seg_bytes > 0) {
+                            seg_mib = sprintf("%.2f", seg_bytes / 1048576)
+                            if (seg_elapsed > 0)
+                                seg_mbps = sprintf("%.2f", (seg_bytes * 8) / seg_elapsed / 1000000)
+                            else
+                                seg_mbps = "N/A"
+                        } else {
+                            seg_mib = last_size_mib
+                            seg_mbps = "N/A"
+                        }
+                        close(cmd)
+                        print ">>> SEGMENT DONE: " last_fname " | " seg_mib " MiB | " seg_mbps " Mbps"
+                        prev_segments_mib += last_size_mib
+                    }
+                    last_printed      = -1
+                    segment_start_time = now
+                    segment_start_mib  = prev_segments_mib
+                    print "---------------------------------------------------------"
+                    print ">>> NEW SEGMENT: " fname
+                    print "---------------------------------------------------------"
+                    fflush()
+                    last_fname = fname
+                }
+                if (line !~ /frames/) continue
             }
 
             # ------------------------------------------------------------------
@@ -466,6 +564,15 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
             if (match(line, /([0-9]+)[[:space:]]+frames/, m)) {
                 frame_count = m[1]
                 now = systime()
+
+                # Start the wall clock on the very first frame, not at awk
+                # BEGIN. BEGIN runs before dvgrab finds the device and waits
+                # for DV signal -- including that pre-capture delay in
+                # elapsed_sec inflates the denominator and deflates bitrate.
+                if (last_frame_seen < 0) {
+                    capture_start_time = now
+                    segment_start_time = now
+                }
 
                 # Stall detection: == avoids false positives when dvgrab
                 # briefly repeats a frame count at segment boundaries.
@@ -498,38 +605,46 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
 
                 # Sample at interval, always print first line
                 if (last_printed < 0 || frame_count - last_printed >= interval) {
+                    # total_sec: frame-derived tape position, used for the
+                    # DV timecode display and Hi8 elapsed-position display.
+                    # It resets at segment boundaries so must NOT be used
+                    # as the bitrate denominator in multi-segment captures.
                     total_sec = int(frame_count * 1001 / 30000)
                     h  = int(total_sec / 3600)
                     m_ = int((total_sec % 3600) / 60)
                     s  = total_sec % 60
 
-                    # Real-time bitrate from cumulative size of ALL segment
-                    # files -- accurate across autosplits, stable at boundaries.
-                    bitrate_mbps = "N/A"
-                    if (total_sec > 5) {
-                        filesize = 0
-                        cmd = "sh -c 'stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null'"
-                        while ((cmd | getline sz) > 0) filesize += sz
-                        close(cmd)
-                        if (filesize > 0)
-                            bitrate_mbps = sprintf("%.2f", (filesize * 8) / total_sec / 1000000)
-                    }
+                    # Wall-clock elapsed time used as the bitrate denominator.
+                    # frame_count resets to zero at each autosplit segment
+                    # boundary, so total_sec derived from it underestimates
+                    # the true elapsed time once a second segment is open,
+                    # causing the reported bitrate to collapse. Wall-clock
+                    # time is monotonically increasing and correctly reflects
+                    # the full capture duration across all segments.
+                    elapsed_sec = now - capture_start_time
 
                     if (tape_type == "dv") {
                         # For Digital8: timecodes are valid so use them directly
-                        # as the position reference. Extract size and timecode
-                        # from the line and format a compact progress line without
-                        # the filename (which changes on every autosplit and would
-                        # be stale after the first segment).
+                        # as the position reference. Include the current segment
+                        # filename so the operator can see which file is being
+                        # written without waiting for the next NEW SEGMENT banner.
+                        # dvgrab MiB value is cumulative across all segments so
+                        # we use it directly for bitrate rather than calling stat,
+                        # avoiding all shell glob quoting issues entirely.
                         size_mib = "?"
                         tc = "?"
                         if (match(line, /([0-9.]+) MiB/, a))  size_mib = a[1]
                         if (match(line, /timecode ([0-9:]+\.[0-9]+)/, a)) tc = a[1]
-                        printf "[PROGRESS %s | %s MiB | %s Mbps]\n", tc, size_mib, bitrate_mbps
+                        if (size_mib != "?") last_size_mib = size_mib + 0
+                        printf "[PROGRESS %s | %s | %s MiB]\n", tc, last_fname, size_mib
                     } else {
-                        # For Hi8: strip garbage timecode/date, keep the rest
-                        # of the line for context since there is only one file
-                        # and no valid timecode.
+                        # For Hi8: strip garbage timecode/date. dvgrab MiB
+                        # value used directly for bitrate -- no glob needed.
+                        hi8_size_mib = "?"
+                        if (match(line, /([0-9.]+) MiB/, a)) hi8_size_mib = a[1]
+                        bitrate_mbps = "N/A"
+                        if (elapsed_sec > 5 && hi8_size_mib != "?")
+                            bitrate_mbps = sprintf("%.2f", (hi8_size_mib * 1048576 * 8) / elapsed_sec / 1000000)
                         clean = line
                         if (clean ~ /timecode [0-9]{2}:[8-9][0-9]:[8-9][0-9]/) {
                             gsub(/ timecode [^ ]+/, "", clean)
@@ -543,30 +658,11 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
                 continue
             }
 
-            # ------------------------------------------------------------------
-            # For Digital8: detect when dvgrab opens a new segment file due to
-            # autosplit and announce it clearly so the operator knows a new
-            # recording session has started on the tape.
-            # ------------------------------------------------------------------
-            if (tape_type == "dv" && line ~ /\.avi":/ && line !~ /frames/) {
-                fname = line
-                gsub(/.*\//, "", fname)   # strip path, keep filename
-                gsub(/".*/, "", fname)    # strip trailing quote and anything after
-                if (fname != last_fname && fname != "") {
-                    print "---------------------------------------------------------"
-                    print ">>> NEW SEGMENT: " fname
-                    print "---------------------------------------------------------"
-                    fflush()
-                    last_fname = fname
-                }
-                continue
-            }
-
             # Pass through everything else (device init messages, etc.)
             print line; fflush()
         }
     }
-' | tee "$LOG_FILE" || true
+' | tee -a "$LOG_FILE" || true
 
 # ==============================================================================
 # 8. Post-Capture Integrity Audit
@@ -701,34 +797,27 @@ FFPROBE_FALLBACK_NOTED=0
 # ==============================================================================
 # 9. Recording Date Analysis
 # ==============================================================================
-# dvgrab writes lines like:
-#   "file001.avi": 30.75 MiB 254 frames timecode 00:00:10.15 date 1995.07.28 14:23:11
-# We extract dates, filter to valid years (1980-2010), deduplicate, and report.
-# Analog Hi8 tapes have no internal clock so all dates will be garbage (e.g. 2067)
-# and will be filtered out -- this is expected and the warning reflects that.
+# For Digital8: filming dates are embedded in the AVI filenames by dvgrab
+# (e.g. test_2012.12.25_06-58-41.avi) so we extract them directly from the
+# filenames -- no log parsing needed and no awk-emitted date lines required.
+#
+# For Hi8: filenames use the capture session date, not the filming date, so
+# we fall back to the log which contains raw dvgrab status lines. On analog
+# Hi8 all dates will be garbage (e.g. 2067) and are filtered out -- expected.
+# ==============================================================================
 echo "---------------------------------------------------------"
 echo "ANALYSING RECORDING DATES..."
 
-if [ -f "$LOG_FILE" ]; then
-    # Extract all dates in YYYY.MM.DD format, filter to sane year range.
-    # grep -oE is portable (no PCRE required); cut trims the "date " prefix.
-    VALID_DATES=$(grep -oE 'date [0-9]{4}\.[0-9]{2}\.[0-9]{2}' "$LOG_FILE" \
-        | cut -d' ' -f2 \
-        | awk -F. '$1 >= 1980 && $1 <= 2010' \
+if [[ "$TAPE_TYPE" == "dv" ]]; then
+    # Extract YYYY.MM.DD from AVI filenames. DV filenames use the filming
+    # date from the DV stream directly so no year filtering is needed --
+    # the dates are trustworthy unlike Hi8 timecodes.
+    VALID_DATES=$(printf '%s\n' "${AVI_FILES[@]}" \
+        | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}' \
         | sort -u)
 
     if [[ -n "$VALID_DATES" ]]; then
         DATE_COUNT=$(echo "$VALID_DATES" | wc -l)
-
-        # First and last valid full timestamps
-        FIRST_STAMP=$(grep -oE 'date [0-9]{4}\.[0-9]{2}\.[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$LOG_FILE" \
-            | cut -d' ' -f2-3 \
-            | awk -F'[. ]' '$1 >= 1980 && $1 <= 2010' | head -1)
-        LAST_STAMP=$(grep -oE 'date [0-9]{4}\.[0-9]{2}\.[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$LOG_FILE" \
-            | cut -d' ' -f2-3 \
-            | awk -F'[. ]' '$1 >= 1980 && $1 <= 2010' | tail -1)
-
-        # Build the report -- write to both terminal and date report file
         {
             echo "RECORDING DATE REPORT: $BASE_NAME"
             echo "Generated: $(date)"
@@ -737,18 +826,44 @@ if [ -f "$LOG_FILE" ]; then
             echo "$VALID_DATES" | while read -r d; do echo "  $d"; done
             echo ""
             echo "Total unique dates: $DATE_COUNT"
-            echo "First valid timestamp: $FIRST_STAMP"
-            echo "Last valid timestamp:  $LAST_STAMP"
             echo "---------------------------------------------------------"
-            echo "NOTE: Dates outside 1980-2010 were filtered as garbage timecode."
-            echo "      If your tape predates 1980 or postdates 2010, edit the"
-            echo "      year range filter in the script."
         } | tee "$DATE_REPORT"
-
     else
-        if [[ "$TAPE_TYPE" == "dv" ]]; then
-            echo "[WARNING] Digital8 mode but no valid recording dates found in log."
-            echo "          The DV stream may have incomplete timecode data."
+        echo "[WARNING] Digital8 mode but no valid recording dates found in filenames."
+        echo "          The DV stream may have incomplete timecode data."
+    fi
+
+else
+    # Hi8: extract dates from log (all will likely be garbage and filtered out)
+    if [ -f "$LOG_FILE" ]; then
+        VALID_DATES=$(grep -oE 'date [0-9]{4}\.[0-9]{2}\.[0-9]{2}' "$LOG_FILE" \
+            | cut -d' ' -f2 \
+            | awk -F. '$1 >= 1980 && $1 <= 2010' \
+            | sort -u)
+
+        if [[ -n "$VALID_DATES" ]]; then
+            DATE_COUNT=$(echo "$VALID_DATES" | wc -l)
+            FIRST_STAMP=$(grep -oE 'date [0-9]{4}\.[0-9]{2}\.[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$LOG_FILE" \
+                | cut -d' ' -f2-3 \
+                | awk -F'[. ]' '$1 >= 1980 && $1 <= 2010' | head -1)
+            LAST_STAMP=$(grep -oE 'date [0-9]{4}\.[0-9]{2}\.[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$LOG_FILE" \
+                | cut -d' ' -f2-3 \
+                | awk -F'[. ]' '$1 >= 1980 && $1 <= 2010' | tail -1)
+            {
+                echo "RECORDING DATE REPORT: $BASE_NAME"
+                echo "Generated: $(date)"
+                echo "---------------------------------------------------------"
+                echo "Unique recording dates found on tape:"
+                echo "$VALID_DATES" | while read -r d; do echo "  $d"; done
+                echo ""
+                echo "Total unique dates: $DATE_COUNT"
+                echo "First valid timestamp: $FIRST_STAMP"
+                echo "Last valid timestamp:  $LAST_STAMP"
+                echo "---------------------------------------------------------"
+                echo "NOTE: Dates outside 1980-2010 were filtered as garbage timecode."
+                echo "      If your tape predates 1980 or postdates 2010, edit the"
+                echo "      year range filter in the script."
+            } | tee "$DATE_REPORT"
         else
             echo "[INFO] No valid recording dates found in log."
             echo "       This is expected for analog Hi8 tapes -- they have no internal"
@@ -756,9 +871,9 @@ if [ -f "$LOG_FILE" ]; then
             echo "       are correctly filtered out. Your capture is not affected."
             echo "[INFO] No valid recording dates found (analog Hi8 -- expected)." >> "$LOG_FILE"
         fi
+    else
+        echo "[WARNING] Log file not found. Cannot analyse recording dates."
     fi
-else
-    echo "[WARNING] Log file not found. Cannot analyse recording dates."
 fi
 
 echo "---------------------------------------------------------"

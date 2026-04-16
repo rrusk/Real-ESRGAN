@@ -1,12 +1,29 @@
 #!/bin/bash
 # ==============================================================================
-# Script Name: capture_passthrough.sh v3 - Analog Passthrough Ingest
+# Script Name: capture_passthrough.sh v5 - Analog Passthrough Ingest
 # Optimized for: Sony DCR-TRV330 acting as FireWire bridge for external VCR
 # Source: VHS (or any analog source connected to the TRV330's A/V inputs)
 # ==============================================================================
 # CHANGE LOG:
-#   v3 -- Changed --format dv2 to --format dv1 (single integrated DV track)
-#         to avoid the audio sync drift caused by dv2's separate audio track.
+#   v5 -- Progress bitrate now reads the cumulative MiB value from dvgrab's
+#         own status line instead of calling stat on output files; avoids all
+#         glob/quoting issues and works correctly across autosplit segments.
+#         capture_start_time reset on first frame received to exclude the
+#         pre-capture device-init delay from elapsed time and bitrate.
+#         Session header written to log after user confirms (not before the
+#         collision check), so the header is never present in an aborted run.
+#         awk pipeline uses tee -a to append to (not overwrite) the header.
+#         mkdir -p for the output directory is no longer treated as fatal if
+#         the directory already exists.
+#
+#   v4 -- Portability: CAPTURE_ROOT now defaults to ~/dv_captures instead of
+#         a hardcoded absolute path, making the script work on any machine
+#         for any user. ~/dv_captures can be a symlink to actual storage.
+#         CAPTURE_ROOT validation now offers to create the directory if
+#         missing (first run), and distinguishes a broken symlink from a
+#         missing directory with an appropriate remediation message.
+#
+#   v3 -- Changed --format dv2 to --format dv1.
 #
 #   v2 -- Applied three fixes from capture_tape.sh v32/v33/v34:
 #         - v32 subline fix: awk now splits each \r-record on \n and processes
@@ -41,10 +58,19 @@
 #
 # Stall detection is still active and will warn if the incoming signal is lost.
 # ==============================================================================
-# CONFIGURATION REQUIRED:
-# Set CAPTURE_ROOT to the absolute path where captured files will be stored.
-# This directory must exist and be writable before running this script.
+# CONFIGURATION:
+# CAPTURE_ROOT defaults to ~/dv_captures, which can be a symlink to wherever
+# your video storage actually lives. This works on any machine for any user.
+#
+# To set up on a new machine:
+#   ln -s /path/to/actual/storage ~/dv_captures
+#
+# Examples:
+#   Mac Mini:  ln -s /mnt/video_capture/avi/captures ~/dv_captures
+#   Desktop:   ln -s /media/rrusk/videodrive/captures ~/dv_captures
+#
 # Override at runtime with: -o /path/to/output
+# Do NOT use relative paths (./captures) as dvgrab will fail to create files.
 # ==============================================================================
 #
 # NOTE: The entire script body is wrapped in main() and called at the bottom.
@@ -80,7 +106,9 @@ fi
 # ==============================================================================
 # Configuration
 # ==============================================================================
-CAPTURE_ROOT="/mnt/video_capture/avi/captures"
+# Default capture root. Use a symlink to point this at actual storage:
+#   ln -s /path/to/actual/storage ~/dv_captures
+CAPTURE_ROOT="${HOME}/dv_captures"
 
 # How often to emit a progress line during capture (seconds).
 # In passthrough mode this is elapsed wall-clock time, not tape position.
@@ -136,9 +164,10 @@ usage() {
     echo "  - Spaces are converted to underscores automatically."
     echo "  - Special characters are stripped for filesystem safety."
     echo ""
-    echo "IMPORTANT: Default CAPTURE_ROOT is hardcoded in this script as:"
-    echo "  ${CAPTURE_ROOT}"
-    echo "  Edit the CAPTURE_ROOT variable at the top of the script to change it."
+    echo "IMPORTANT: Default CAPTURE_ROOT is: ${CAPTURE_ROOT}"
+    echo "  This can be a symlink to your actual storage location:"
+    echo "    ln -s /path/to/actual/storage ~/dv_captures"
+    echo "  Or override at runtime with: -o /path/to/output"
     echo ""
 }
 
@@ -192,10 +221,30 @@ EXTRA_DESC="${2:-}"
 # ==============================================================================
 # 2. Validate CAPTURE_ROOT
 # ==============================================================================
+if [ ! -e "$CAPTURE_ROOT" ]; then
+    echo "[WARNING] CAPTURE_ROOT does not exist: $CAPTURE_ROOT"
+    if [ -L "$CAPTURE_ROOT" ]; then
+        echo "          This is a broken symlink. Fix it with:"
+        echo "            ln -sf /path/to/actual/storage $CAPTURE_ROOT"
+        exit 1
+    fi
+    read -p "          Create it now? (y/n): " _CREATE
+    if [[ "$_CREATE" =~ ^[Yy]$ ]]; then
+        mkdir -p "$CAPTURE_ROOT" || {
+            echo "[ERROR] Failed to create: $CAPTURE_ROOT"
+            exit 1
+        }
+        echo "[INFO] Created: $CAPTURE_ROOT"
+        echo "       Consider making this a symlink to your actual storage:"
+        echo "         rmdir $CAPTURE_ROOT"
+        echo "         ln -s /path/to/actual/storage $CAPTURE_ROOT"
+    else
+        echo "Aborted. Create the directory or symlink and retry."
+        exit 1
+    fi
+fi
 if [ ! -d "$CAPTURE_ROOT" ]; then
-    echo "[ERROR] CAPTURE_ROOT does not exist: $CAPTURE_ROOT"
-    echo "        Create it with: mkdir -p $CAPTURE_ROOT"
-    echo "        Or specify a different path with: -o /path/to/output"
+    echo "[ERROR] CAPTURE_ROOT exists but is not a directory: $CAPTURE_ROOT"
     exit 1
 fi
 if [ ! -w "$CAPTURE_ROOT" ]; then
@@ -225,10 +274,7 @@ LOG_FILE="${OUTPUT_DIR}/${BASE_NAME}.log"
 # ==============================================================================
 # 4. Pre-flight: Directory Collision Check
 # ==============================================================================
-mkdir -p "$OUTPUT_DIR" || {
-    echo "[ERROR] Failed to create output directory: $OUTPUT_DIR"
-    exit 1
-}
+mkdir -p "$OUTPUT_DIR"
 if [ "$(find "$OUTPUT_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
     echo "[WARNING] Output directory is not empty: $OUTPUT_DIR"
     echo "          A previous capture may exist. Continuing will mix files."
@@ -250,7 +296,7 @@ if ! ls /dev/fw* &>/dev/null && ! ls /dev/raw1394 &>/dev/null; then
 fi
 
 echo "========================================================="
-echo "PASSTHROUGH INGEST: $BASE_NAME"
+echo "PASSTHROUGH INGEST: $BASE_NAME  [capture_passthrough.sh v5]"
 echo "Output:  $OUTPUT_DIR"
 echo "---------------------------------------------------------"
 echo "CHECKLIST:"
@@ -267,6 +313,15 @@ if [[ ! "$PROCEED" =~ ^[Yy]$ ]]; then
     echo "Capture aborted by user."
     exit 2
 fi
+
+# Write session header to log now that the user has confirmed capture.
+# The awk pipeline appends to this file via tee -a.
+{
+    echo "capture_passthrough.sh v5"
+    echo "Session: $BASE_NAME"
+    echo "Started: $(date)"
+    echo "---------------------------------------------------------"
+} > "$LOG_FILE"
 
 # ==============================================================================
 # 6. Flag Configuration
@@ -381,6 +436,12 @@ STALL_TIMEOUT_SEC=15
                 frame_count = m[1]
                 now         = systime()
 
+                # Reset wall clock on the very first frame, not at BEGIN.
+                # BEGIN fires before dvgrab connects and signals ready, so
+                # including that pre-capture wait inflates elapsed_sec and
+                # deflates the reported bitrate.
+                if (last_frame_seen < 0) capture_start_time = now
+
                 # Stall detection: no frame progress for stall_sec seconds.
                 # last_frame_seen >= 0 skips the comparison on the very first
                 # record (before a baseline exists); frame counts start at 0
@@ -409,29 +470,24 @@ STALL_TIMEOUT_SEC=15
                 # Sample at interval, always print first line.
                 if (last_printed < 0 || frame_count - last_printed >= interval) {
 
-                    # Elapsed capture time from this script'\''s start (wall clock).
+                    # Elapsed capture time from wall clock since first frame.
                     elapsed_sec = now - capture_start_time
                     h   = int(elapsed_sec / 3600)
                     m_  = int((elapsed_sec % 3600) / 60)
                     s   = elapsed_sec % 60
 
-                    # Real-time bitrate from cumulative size of ALL segment files.
-                    # Wrapped in sh -c so the shell handles glob expansion safely
-                    # even when OUTPUT_DIR contains spaces (v33 fix).
+                    # Bitrate from dvgrab cumulative MiB value in the status
+                    # line -- tracks total bytes written across all segments,
+                    # no stat/glob needed, avoids all quoting issues.
                     bitrate_mbps = "N/A"
-                    if (elapsed_sec > 5) {
-                        filesize = 0
-                        cmd = "sh -c 'stat -c%s \"" outfile_prefix "\"*.avi 2>/dev/null'"
-                        while ((cmd | getline sz) > 0) filesize += sz
-                        close(cmd)
-                        if (filesize > 0)
-                            bitrate_mbps = sprintf("%.2f", (filesize * 8) / elapsed_sec / 1000000)
-                    }
+                    size_mib = "?"
+                    if (match(line, /([0-9.]+) MiB/, a)) size_mib = a[1]
+                    if (elapsed_sec > 5 && size_mib != "?")
+                        bitrate_mbps = sprintf("%.2f", (size_mib * 1048576 * 8) / elapsed_sec / 1000000)
 
-                    # Strip the timecode and date fields from the status line.
-                    # In passthrough mode these are today'\''s wall-clock values
-                    # from the TRV330 — they are not original recording dates
-                    # and add no useful information for the operator.
+                    # Strip timecode and date fields from the status line.
+                    # In passthrough mode these are wall-clock values from
+                    # the TRV330 -- not original recording dates.
                     clean = line
                     gsub(/ timecode [^ ]+/, "", clean)
                     gsub(/ date [0-9]+\.[0-9]+\.[0-9]+ [0-9:]+/, "", clean)
@@ -447,7 +503,7 @@ STALL_TIMEOUT_SEC=15
             print line; fflush()
         }
     }
-' | tee "$LOG_FILE" || true
+' | tee -a "$LOG_FILE" || true
 
 # ==============================================================================
 # 8. Post-Capture Integrity Audit

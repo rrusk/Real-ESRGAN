@@ -325,6 +325,11 @@ def autotune_chunk_size(input_video_path, scale_factor):
         est_png_mb = (pixels * bytes_per_pixel * EST_PNG_COMP_RATIO) / (1024**2)
         print(f"Estimated PNG frame size: {est_png_mb:.2f} MB")
 
+        # Peak disk usage occurs when RIFE input and output frame dirs coexist on disk
+        # simultaneously: 2x the source frame count (1x input + 1x output frames).
+        # With --no-rife this is a safe overestimate; with a 60fps mode=1 master fps
+        # is already ~60 so *2 remains a reasonable worst-case. The conservative
+        # overestimate is intentional — disk space is the hard constraint here.
         pngs_per_sec = fps * 2
         mb_per_sec = pngs_per_sec * est_png_mb
         print(f"Estimated temp disk usage per sec: {mb_per_sec:.2f} MB/s")
@@ -359,6 +364,8 @@ Examples:
   %(prog)s video.avi --profile halo          # halo/ringing suppression
   %(prog)s video.avi --profile dv            # optimised for MiniDV/Digital8/DV AVI sources
   %(prog)s video.avi --profile hi8dv         # Hi8 tape via Digital8/FireWire direct capture
+  %(prog)s video.avi --no-rife               # skip RIFE interpolation (30fps in -> 30fps out)
+  %(prog)s video.avi --no-rife               # also correct for 60fps mode=1 masters (60fps in -> 60fps out)
   %(prog)s camcorder.mp4                     # works with DV, Hi8, and other camcorder formats
   %(prog)s video.avi --model realesr-general-x4v3   # use general degradation model at 2x output
   %(prog)s video.avi -s 4 --model realesr-general-x4v3  # general model at 4x output
@@ -432,6 +439,18 @@ Pre-filter profiles (--profile):
         metavar="HOURS",
         help="Maximum runtime in hours before graceful shutdown. Script will not start a new chunk if (elapsed time + last chunk duration) would exceed this limit. Example: --max-runtime 8"
     )
+    parser.add_argument(
+        "--no-rife",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip RIFE frame interpolation. Output FPS matches input FPS. "
+            "Use with 30fps masters (bwdif mode=0) to avoid OSD/timecode artifacts "
+            "at the cost of not doubling frame rate. "
+            "Required for 60fps masters (bwdif mode=1) — RIFE is blocked on ~60fps "
+            "input to prevent accidental 120fps output."
+        )
+    )
     return parser.parse_args()
 
 def main(args):
@@ -457,15 +476,23 @@ def main(args):
     
     # --- Pre-filter Profile Selection ---
     # Selected via --profile. Default: balanced.
-    # Filter chains are defined in PROFILES; adding a new profile is a one-line change.
+    # Filter chains are defined in PROFILES_30FPS; PROFILES_60FPS holds variants
+    # with halved temporal hqdn3d values for ~60fps (bwdif mode=1) masters.
+    #
+    # At 60fps the inter-frame delta per field is half that of 30fps, so the same
+    # temporal strength over-smooths relative to actual motion. The temporal
+    # parameters (the last two values of hqdn3d=luma_sp:chroma_sp:luma_tmp:chroma_tmp)
+    # are approximately halved in the 60fps variants. Spatial and sharpening values
+    # are identical between the two sets — only temporal smoothing changes.
+    # The correct set is selected automatically based on source_fps_float below.
+    #
+    # 30fps profiles (bwdif mode=0 masters, or any source <= 45fps):
     #
     #   balanced   hqdn3d=2:2:6:6, pp=fd, unsharp=3:3:0.2
     #     Light spatial denoise preserves texture for ESRGAN. Temporal at 6:6 stabilises
     #     frame-to-frame flicker without touching real detail. pp=fd handles DVD
     #     macroblocking. Minimal sharpening avoids pre-upscale halos.
-    #     Tuned for Hi8/S-Video capture -> DVD (~4.6Mbps source). Note: the
-    #     deinterlaced master produced by prepare_video.sh will be ~6.5Mbps;
-    #     the relevant quality level is the DVD source, not the master.
+    #     Tuned for Hi8/S-Video capture -> DVD (~4.6Mbps source).
     #
     #   aggressive hqdn3d=3:3:6:6, pp=ac, unsharp=3:3:0.6
     #     Stronger denoise and sharpening for heavy noise or composite-captured sources.
@@ -486,12 +513,18 @@ def main(args):
     #     over FireWire as a DV stream. No MPEG-2 blocking or ringing — those
     #     artifacts are absent because the DVD authoring step is bypassed.
     #     Temporal at 5:5 (lighter than balanced) since MPEG-2 compression
-    #     flicker is gone; only genuine Hi8 tape noise remains. pp=ac targets
-    #     the light DCT blocking introduced by the DV codec itself. Light
-    #     spatial denoise and minimal sharpen preserve analog tape character
-    #     for ESRGAN to work with.
+    #     flicker is gone; only genuine Hi8 tape noise remains.
+    #
+    # 60fps profiles (bwdif mode=1 masters, source > 45fps):
+    #   Temporal values halved vs. 30fps counterparts. All other values identical.
+    #
+    #   balanced   hqdn3d=2:2:3:3, pp=fd, unsharp=3:3:0.2
+    #   aggressive hqdn3d=3:3:3:3, pp=ac, unsharp=3:3:0.6
+    #   halo       hqdn3d=4:4:4:4, pp=fd, unsharp=3:3:0.2
+    #   dv         hqdn3d=1.5:1.5:2:2, pp=ac, unsharp=3:3:0.25
+    #   hi8dv      hqdn3d=2:2:2.5:2.5, pp=ac, unsharp=3:3:0.2
 
-    PROFILES = {
+    PROFILES_30FPS = {
         "balanced":   "hqdn3d=2:2:6:6,pp=fd,unsharp=3:3:0.2",
         "aggressive": "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
         "halo":       "hqdn3d=4:4:8:8,pp=fd,unsharp=3:3:0.2",
@@ -499,11 +532,21 @@ def main(args):
         "hi8dv":      "hqdn3d=2:2:5:5,pp=ac,unsharp=3:3:0.2",
     }
 
+    # Temporal hqdn3d values (luma_tmp:chroma_tmp) halved for 60fps field-rate
+    # masters. At twice the frame rate, consecutive frames are closer in time,
+    # so the same temporal strength would over-smooth genuine motion.
+    PROFILES_60FPS = {
+        "balanced":   "hqdn3d=2:2:3:3,pp=fd,unsharp=3:3:0.2",
+        "aggressive": "hqdn3d=3:3:3:3,pp=ac,unsharp=3:3:0.6",
+        "halo":       "hqdn3d=4:4:4:4,pp=fd,unsharp=3:3:0.2",
+        "dv":         "hqdn3d=1.5:1.5:2:2,pp=ac,unsharp=3:3:0.25",
+        "hi8dv":      "hqdn3d=2:2:2.5:2.5,pp=ac,unsharp=3:3:0.2",
+    }
+
     profile = args.profile
-    prefilter_vf = PROFILES[profile]
 
     profile_descriptions = {
-        "balanced":   "Light spatial denoise, temporal 6:6 for flicker stability, fast deblock, minimal sharpen. "
+        "balanced":   "Light spatial denoise, temporal stability, fast deblock, minimal sharpen. "
                       "Optimised for Hi8/S-Video capture -> DVD (~4.6Mbps source).",
         "aggressive": "Strong denoise, full deblock+dering, more sharpen. "
                       "Recommended for heavy noise, composite captures, or low-bitrate DVD sources.",
@@ -511,10 +554,9 @@ def main(args):
                       "Use if you see white ghost lines around dark edges.",
         "dv":         "Light spatial denoise, moderate temporal smoothing, full deblock+dering, gentle sharpen. "
                       "Optimised for MiniDV / Digital8 / DV AVI sources.",
-        "hi8dv":      "Light spatial denoise, temporal 5:5 (no MPEG-2 flicker to suppress), full deblock+dering, minimal sharpen. "
+        "hi8dv":      "Light spatial denoise, moderate temporal smoothing, full deblock+dering, minimal sharpen. "
                       "Optimised for Hi8 tape via Digital8/FireWire direct DV capture.",
     }
-    print(f"   [Profile] {profile}: {profile_descriptions[profile]}")
 
     # Calculate FFmpeg thread count
     if args.threads and args.threads > 0:
@@ -535,6 +577,11 @@ def main(args):
         REALSRGAN_MODEL = "RealESRGAN_x2plus"
     elif SCALE_FACTOR == 4:
         REALSRGAN_MODEL = "RealESRGAN_x4plus"
+
+    # Profile description is printed here, in the setup summary, so it appears
+    # alongside scale/model/thread config. The resolved filter string (which
+    # depends on source_fps_float) is printed later at deferred profile selection.
+    print(f"   [Profile] {profile}: {profile_descriptions[profile]}")
     
     input_basename = os.path.splitext(os.path.basename(INPUT_VIDEO))[0]
     MODEL_SHORT = {"RealESRGAN_x2plus": "x2plus", "RealESRGAN_x4plus": "x4plus", "realesr-general-x4v3": "gen-x4v3"}.get(REALSRGAN_MODEL, REALSRGAN_MODEL)
@@ -555,6 +602,9 @@ def main(args):
         "scale_factor": SCALE_FACTOR,
         "profile": profile,
         "model": REALSRGAN_MODEL,
+        # no_rife is included so that a resumed run cannot accidentally mix
+        # RIFE-interpolated and non-interpolated chunks in the same output.
+        "no_rife": args.no_rife,
     }
     
     if os.path.exists(metadata_file):
@@ -632,7 +682,36 @@ def main(args):
     duration = get_video_duration(INPUT_VIDEO)
     source_fps_str = get_video_fps(INPUT_VIDEO)
     source_fps_float = float(source_fps_str)
-    output_fps_float = source_fps_float * 2
+
+    # Guard: ~60fps input + RIFE would produce ~120fps output, which is never
+    # the intent. This indicates a bwdif mode=1 master was passed in without
+    # --no-rife. Abort early with a clear message rather than silently producing
+    # a 120fps file after hours of processing.
+    if source_fps_float > 45 and not args.no_rife:
+        print(f"\n[!] ERROR: Input is ~{source_fps_float:.3f}fps (bwdif mode=1 master) "
+              f"but --no-rife was not specified.")
+        print("    Running RIFE on a 60fps master would produce ~120fps output.")
+        print("    Either:")
+        print("      - Add --no-rife to process at 60fps without interpolation")
+        print("      - Re-run prepare_video.sh with bwdif mode=0 to get a 30fps master")
+        sys.exit(1)
+
+    # With RIFE enabled, output is double the source rate.
+    # With --no-rife, output matches source rate exactly.
+    output_fps_float = source_fps_float if args.no_rife else source_fps_float * 2
+
+    # --- Deferred profile selection (requires source_fps_float) ---
+    # 60fps masters (bwdif mode=1) use halved temporal hqdn3d values to avoid
+    # over-smoothing frames that are already half the inter-frame distance apart.
+    # The threshold of 45fps cleanly separates 29.97/25fps masters from 59.94/50fps.
+    if source_fps_float > 45:
+        prefilter_vf = PROFILES_60FPS[profile]
+        fps_label = "60fps"
+    else:
+        prefilter_vf = PROFILES_30FPS[profile]
+        fps_label = "30fps"
+    print(f"   [Profile filter] {profile} ({fps_label} variant): {prefilter_vf}")
+
     source_sar = get_video_sar(INPUT_VIDEO)
     if source_sar:
         print(f"Source SAR detected: {source_sar} (non-square pixels — will be preserved in final output.)")
@@ -641,7 +720,10 @@ def main(args):
     total_chunks = math.ceil(duration / CHUNK_DURATION_SECONDS)
     print(f"Video detected: {duration:.2f}s, {source_fps_str} FPS.")
     print(f"Using {CHUNK_DURATION_SECONDS}s chunks, splitting into {total_chunks} total chunks.")
-    print(f"RIFE output will be {output_fps_float:.3f} FPS.")
+    if args.no_rife:
+        print(f"RIFE disabled (--no-rife): output will be {output_fps_float:.3f} FPS (matches input).")
+    else:
+        print(f"RIFE enabled: output will be {output_fps_float:.3f} FPS (2x input).")
 
     # Also accept a previously extracted .mp3 fallback from an earlier run
     if os.path.exists(ORIGINAL_AUDIO_FILE_MP3) and os.path.getsize(ORIGINAL_AUDIO_FILE_MP3) > 0:
@@ -833,108 +915,125 @@ def main(args):
             skipped_esrgan = True
             print(f"  > Found existing Real-ESRGAN output, skipping to RIFE.")
 
-        # --- Step 2: Run RIFE (Multi-Step) ---
-        # Check if RIFE input frames already exist and are complete
-        existing_in_frames = glob.glob(os.path.join(rife_in_frames_dir, "*.png")) if os.path.isdir(rife_in_frames_dir) else []
-        if existing_in_frames:
-            skipped_frame_extraction = True
-            print(f"  > Found {len(existing_in_frames)} existing RIFE input frames, skipping extraction.")
-        else:
-            print(f"  > Extracting frames for RIFE...")
-            os.makedirs(rife_in_frames_dir, exist_ok=True)
-            cmd_extract = [
-                "ffmpeg", "-i", esrgan_output_file,
-                os.path.join(rife_in_frames_dir, "frame_%08d.png")
-            ]
-            # Timeout: allow 10s per expected frame plus a 120s fixed overhead.
-            # Normal extraction takes 20-45s. This catches silent hangs (e.g. a
-            # subprocess pipe buffer deadlock with capture_output=True) that would
-            # otherwise block the pipeline indefinitely without any error output.
-            # capture_output=True is intentionally kept to preserve error messages
-            # on genuine failures; the timeout is the safeguard against deadlock.
-            expected_frames = int(source_fps_float * CHUNK_DURATION_SECONDS)
-            extraction_timeout = 120 + (expected_frames * 10)
-            try:
-                with Timer(f"{chunk_name} RIFE Frame Extraction"):
-                    subprocess.run(cmd_extract, check=True, capture_output=True,
-                                   text=True, timeout=extraction_timeout)
-            except subprocess.TimeoutExpired:
-                print(f"\n--- ERROR: FFmpeg frame extraction timed out on {chunk_name} ---")
-                print(f"    Timeout: {extraction_timeout}s "
-                      f"(expected ~{expected_frames} frames at {source_fps_float:.3f} fps)")
-                print(f"    Partial frames in {rife_in_frames_dir} will be wiped on next run.")
-                print(f"    If this recurs, check disk I/O and available space.")
-                raise RuntimeError(f"Frame extraction timed out after {extraction_timeout}s on {chunk_name}")
-            except subprocess.CalledProcessError as e:
-                print(f"\n--- ERROR: FFmpeg frame extraction failed on {chunk_name} ---")
-                print("STDOUT:", e.stdout)
-                print("STDERR:", e.stderr)
-                raise
+        # --- Step 2: Run RIFE (Multi-Step) or bypass ---
+        if args.no_rife:
+            # --no-rife: promote the ESRGAN output directly to the rife chunk slot.
+            # All downstream logic (concat, cleanup, ETA) is undisturbed because it
+            # only ever references rife_output_file, never esrgan_output_file directly.
+            # cleanup_intermediate_files() tolerates a missing esrgan_output_file
+            # (it was renamed, not deleted) and missing frame dirs (never created).
+            print(f"  > Skipping RIFE (--no-rife): promoting ESRGAN output to final chunk slot.")
+            os.rename(esrgan_output_file, rife_output_file)
+            print(f"  > No-RIFE complete: {rife_output_file}")
 
-        in_frames = glob.glob(os.path.join(rife_in_frames_dir, "*.png"))
-        existing_out_frames = glob.glob(os.path.join(rife_out_frames_dir, "*.png")) if os.path.isdir(rife_out_frames_dir) else []
-        expected_out = len(in_frames) * 2
-        if len(existing_out_frames) >= expected_out - 2:
-            print(f"  > Found {len(existing_out_frames)} existing RIFE output frames (expected ~{expected_out}), skipping interpolation.")
-            out_frames = existing_out_frames
+            # --- CRITICAL: Aggressive Cleanup (no-RIFE path) ---
+            # esrgan_output_file was renamed above so it no longer exists at its
+            # original path; cleanup_intermediate_files() handles that gracefully.
+            # rife_in_frames_dir and rife_out_frames_dir were never created.
+            cleanup_intermediate_files(input_chunk, esrgan_output_file, rife_in_frames_dir, rife_out_frames_dir)
+
         else:
-            if existing_out_frames:
-                print(f"  > WARNING: Found only {len(existing_out_frames)}/{expected_out} RIFE output frames (partial). Wiping and re-interpolating.")
-                safe_rmtree(rife_out_frames_dir)
-            print(f"  > Running RIFE (directory mode)...")
-            os.makedirs(rife_out_frames_dir, exist_ok=True)
-            cmd_rife = [ 
-                RIFE_BIN, 
-                "-i", rife_in_frames_dir, 
-                "-o", rife_out_frames_dir,
-                "-s", "0.5"
-            ]
-            try:
-                with Timer(f"{chunk_name} RIFE Interpolation"):
-                    subprocess.run(cmd_rife, check=True, capture_output=True, text=True)
-            except subprocess.CalledProcessError as e:
-                print(f"\n--- ERROR: RIFE failed on {chunk_name} ---")
-                print("STDOUT:", e.stdout)
-                print("STDERR:", e.stderr)
-                raise
+            # Check if RIFE input frames already exist and are complete
+            existing_in_frames = glob.glob(os.path.join(rife_in_frames_dir, "*.png")) if os.path.isdir(rife_in_frames_dir) else []
+            if existing_in_frames:
+                skipped_frame_extraction = True
+                print(f"  > Found {len(existing_in_frames)} existing RIFE input frames, skipping extraction.")
+            else:
+                print(f"  > Extracting frames for RIFE...")
+                os.makedirs(rife_in_frames_dir, exist_ok=True)
+                cmd_extract = [
+                    "ffmpeg", "-i", esrgan_output_file,
+                    os.path.join(rife_in_frames_dir, "frame_%08d.png")
+                ]
+                # Timeout: allow 10s per expected frame plus a 120s fixed overhead.
+                # Normal extraction takes 20-45s. This catches silent hangs (e.g. a
+                # subprocess pipe buffer deadlock with capture_output=True) that would
+                # otherwise block the pipeline indefinitely without any error output.
+                # capture_output=True is intentionally kept to preserve error messages
+                # on genuine failures; the timeout is the safeguard against deadlock.
+                expected_frames = int(source_fps_float * CHUNK_DURATION_SECONDS)
+                extraction_timeout = 120 + (expected_frames * 10)
+                try:
+                    with Timer(f"{chunk_name} RIFE Frame Extraction"):
+                        subprocess.run(cmd_extract, check=True, capture_output=True,
+                                       text=True, timeout=extraction_timeout)
+                except subprocess.TimeoutExpired:
+                    print(f"\n--- ERROR: FFmpeg frame extraction timed out on {chunk_name} ---")
+                    print(f"    Timeout: {extraction_timeout}s "
+                          f"(expected ~{expected_frames} frames at {source_fps_float:.3f} fps)")
+                    print(f"    Partial frames in {rife_in_frames_dir} will be wiped on next run.")
+                    print(f"    If this recurs, check disk I/O and available space.")
+                    raise RuntimeError(f"Frame extraction timed out after {extraction_timeout}s on {chunk_name}")
+                except subprocess.CalledProcessError as e:
+                    print(f"\n--- ERROR: FFmpeg frame extraction failed on {chunk_name} ---")
+                    print("STDOUT:", e.stdout)
+                    print("STDERR:", e.stderr)
+                    raise
+
+            in_frames = glob.glob(os.path.join(rife_in_frames_dir, "*.png"))
+            existing_out_frames = glob.glob(os.path.join(rife_out_frames_dir, "*.png")) if os.path.isdir(rife_out_frames_dir) else []
+            expected_out = len(in_frames) * 2
+            if len(existing_out_frames) >= expected_out - 2:
+                print(f"  > Found {len(existing_out_frames)} existing RIFE output frames (expected ~{expected_out}), skipping interpolation.")
+                out_frames = existing_out_frames
+            else:
+                if existing_out_frames:
+                    print(f"  > WARNING: Found only {len(existing_out_frames)}/{expected_out} RIFE output frames (partial). Wiping and re-interpolating.")
+                    safe_rmtree(rife_out_frames_dir)
+                print(f"  > Running RIFE (directory mode)...")
+                os.makedirs(rife_out_frames_dir, exist_ok=True)
+                cmd_rife = [
+                    RIFE_BIN,
+                    "-i", rife_in_frames_dir,
+                    "-o", rife_out_frames_dir,
+                    "-s", "0.5"
+                ]
+                try:
+                    with Timer(f"{chunk_name} RIFE Interpolation"):
+                        subprocess.run(cmd_rife, check=True, capture_output=True, text=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"\n--- ERROR: RIFE failed on {chunk_name} ---")
+                    print("STDOUT:", e.stdout)
+                    print("STDERR:", e.stderr)
+                    raise
+                out_frames = glob.glob(os.path.join(rife_out_frames_dir, "*.png"))
+
+            print("  > Verifying RIFE frame count...")
             out_frames = glob.glob(os.path.join(rife_out_frames_dir, "*.png"))
 
-        print("  > Verifying RIFE frame count...")
-        out_frames = glob.glob(os.path.join(rife_out_frames_dir, "*.png"))
-        
-        if len(out_frames) < len(in_frames) * 2 - 2:
-            raise RuntimeError(
-                f"RIFE failed to double frames! "
-                f"Input: {len(in_frames)} frames, "
-                f"Output: {len(out_frames)} frames."
-            )
-        print(f"  > RIFE check passed (Input: {len(in_frames)}, Output: {len(out_frames)}).")
+            if len(out_frames) < len(in_frames) * 2 - 2:
+                raise RuntimeError(
+                    f"RIFE failed to double frames! "
+                    f"Input: {len(in_frames)} frames, "
+                    f"Output: {len(out_frames)} frames."
+                )
+            print(f"  > RIFE check passed (Input: {len(in_frames)}, Output: {len(out_frames)}).")
 
-        print(f"  > Encoding RIFE frames to video...")
-        cmd_encode = [
-            "ffmpeg",
-            "-framerate", str(output_fps_float),
-            "-i", os.path.join(rife_out_frames_dir, "%08d.png"),
-            "-c:v", "libx264",
-            "-threads", str(threads),
-            "-pix_fmt", "yuv420p",
-            "-crf", "17", # <-- Quality Fix: CRF 17 for high-bitrate 4K assembly
-            "-preset", "slower", # <-- Quality Fix: 'slower' for maximum fidelity
-            rife_output_file
-        ]
-        try:
-            with Timer(f"{chunk_name} RIFE Frame Encoding"):
-                subprocess.run(cmd_encode, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            print(f"\n--- ERROR: FFmpeg frame encoding failed on {chunk_name} ---")
-            print("STDOUT:", e.stdout)
-            print("STDERR:", e.stderr)
-            raise
+            print(f"  > Encoding RIFE frames to video...")
+            cmd_encode = [
+                "ffmpeg",
+                "-framerate", str(output_fps_float),
+                "-i", os.path.join(rife_out_frames_dir, "%08d.png"),
+                "-c:v", "libx264",
+                "-threads", str(threads),
+                "-pix_fmt", "yuv420p",
+                "-crf", "17", # <-- Quality Fix: CRF 17 for high-bitrate 4K assembly
+                "-preset", "slower", # <-- Quality Fix: 'slower' for maximum fidelity
+                rife_output_file
+            ]
+            try:
+                with Timer(f"{chunk_name} RIFE Frame Encoding"):
+                    subprocess.run(cmd_encode, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                print(f"\n--- ERROR: FFmpeg frame encoding failed on {chunk_name} ---")
+                print("STDOUT:", e.stdout)
+                print("STDERR:", e.stderr)
+                raise
 
-        print(f"  > RIFE complete: {rife_output_file}")
+            print(f"  > RIFE complete: {rife_output_file}")
 
-        # --- CRITICAL: Aggressive Cleanup ---
-        cleanup_intermediate_files(input_chunk, esrgan_output_file, rife_in_frames_dir, rife_out_frames_dir)
+            # --- CRITICAL: Aggressive Cleanup ---
+            cleanup_intermediate_files(input_chunk, esrgan_output_file, rife_in_frames_dir, rife_out_frames_dir)
         
         chunk_end_time = time.time()
         duration_sec = chunk_end_time - chunk_start_time

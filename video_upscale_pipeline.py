@@ -11,6 +11,7 @@ import glob
 import time
 import sys
 import argparse
+import re
 from datetime import datetime, timedelta
 import statistics
 
@@ -20,7 +21,7 @@ RIFE_BIN = "./rife-ncnn-vulkan/rife-ncnn-vulkan"
 
 # --- Auto-Tuning Config ---
 MIN_CHUNK_SEC = 10
-MAX_CHUNK_SEC = 120
+MAX_CHUNK_SEC = 300  # Tuned for RTX 4060 Ti; was 120 for GTX 1060
 DISK_SAFETY_MARGIN = 0.5
 EST_PNG_COMP_RATIO = 0.4 
 
@@ -340,12 +341,25 @@ def autotune_chunk_size(input_video_path, scale_factor):
         max_chunk_sec_disk = (usable_temp_gb * 1024) / mb_per_sec
         print(f"Disk capacity allows for {max_chunk_sec_disk:.0f} second chunks.")
 
+        if max_chunk_sec_disk < MIN_CHUNK_SEC:
+            # Not enough disk even for the minimum chunk size on a fresh run.
+            # Abort here rather than picking a smaller size — on a resumed run
+            # this path is never reached (autotune is skipped entirely).
+            needed_gb = (MIN_CHUNK_SEC * mb_per_sec) / (DISK_SAFETY_MARGIN * 1024)
+            print(f"\n[!] ERROR: Insufficient disk space to start a new run.")
+            print(f"    Minimum chunk size ({MIN_CHUNK_SEC}s) requires ~{needed_gb:.1f} GB free.")
+            print(f"    Available: {free_disk_gb:.2f} GB free at current path.")
+            print(f"    Free up at least {needed_gb - free_disk_gb:.1f} GB and retry.")
+            raise RuntimeError("Insufficient disk space for minimum chunk size.")
+
         final_chunk_sec = max(MIN_CHUNK_SEC, min(max_chunk_sec_disk, MAX_CHUNK_SEC))
-        
+
         print(f"Clamped to {final_chunk_sec:.0f} seconds (Min: {MIN_CHUNK_SEC}s, Max: {MAX_CHUNK_SEC}s)")
         print("--------------------------------")
         return int(final_chunk_sec)
 
+    except RuntimeError:
+        raise  # propagate disk space errors directly — do not swallow
     except Exception as e:
         print(f"WARNING: Auto-tuning failed ({e}). Falling back to safe 10s chunks.")
         print("--------------------------------")
@@ -364,9 +378,9 @@ Examples:
   %(prog)s video.avi --profile halo          # halo/ringing suppression
   %(prog)s video.avi --profile dv            # optimised for MiniDV/Digital8/DV AVI sources
   %(prog)s video.avi --profile hi8dv         # Hi8 tape via Digital8/FireWire direct capture
-  %(prog)s video.avi --no-rife               # skip RIFE interpolation (30fps in -> 30fps out)
-  %(prog)s video.avi --no-rife               # also correct for 60fps mode=1 masters (60fps in -> 60fps out)
-  %(prog)s camcorder.mp4                     # works with DV, Hi8, and other camcorder formats
+  %(prog)s video.mp4 --no-rife              # 30fps mode=0 master: upscale only, 30fps out, half the ESRGAN cost of mode=1
+  %(prog)s video_60fps.mp4 --no-rife        # 60fps mode=1 master: full field-rate temporal resolution, 60fps out
+  %(prog)s camcorder.mp4                    # works with DV, Hi8, and other camcorder formats
   %(prog)s video.avi --model realesr-general-x4v3   # use general degradation model at 2x output
   %(prog)s video.avi -s 4 --model realesr-general-x4v3  # general model at 4x output
 
@@ -445,10 +459,13 @@ Pre-filter profiles (--profile):
         default=False,
         help=(
             "Skip RIFE frame interpolation. Output FPS matches input FPS. "
-            "Use with 30fps masters (bwdif mode=0) to avoid OSD/timecode artifacts "
-            "at the cost of not doubling frame rate. "
-            "Required for 60fps masters (bwdif mode=1) — RIFE is blocked on ~60fps "
-            "input to prevent accidental 120fps output."
+            "Two valid uses: "
+            "(1) 30fps mode=0 master: upscale only, no frame doubling, half the ESRGAN "
+            "cost of the mode=1 path. bwdif mode=0 has already combined both fields into "
+            "full-resolution frames so all source data is present. "
+            "(2) 60fps mode=1 master (prepare_video.sh --mode1): preserves field-rate "
+            "temporal resolution at 2x ESRGAN cost. RIFE is blocked on ~60fps input "
+            "without this flag to prevent accidental 120fps output."
         )
     )
     return parser.parse_args()
@@ -584,8 +601,21 @@ def main(args):
     print(f"   [Profile] {profile}: {profile_descriptions[profile]}")
     
     input_basename = os.path.splitext(os.path.basename(INPUT_VIDEO))[0]
+    # Strip any fps/rife suffix that prepare_video.sh may have embedded in the
+    # master filename (e.g. _60fps, _30fps). The pipeline appends its own
+    # authoritative suffix later, so leaving these in would produce duplicates
+    # like _60fps_..._60fps in the output filename.
+    # The lambda preserves the trailing timestamp (_YYYYMMDD_HHMMSS) if present
+    # while removing only the fps/rife token that precedes it.
+    input_basename = re.sub(
+        r'_(60fps_rife|60fps|30fps)(_\d{8}_\d{6})?$',
+        lambda m: m.group(2) or '',
+        input_basename
+    )
     MODEL_SHORT = {"RealESRGAN_x2plus": "x2plus", "RealESRGAN_x4plus": "x4plus", "realesr-general-x4v3": "gen-x4v3"}.get(REALSRGAN_MODEL, REALSRGAN_MODEL)
-    FINAL_VIDEO_FILE = os.path.join(OUTPUT_DIR, f"{input_basename}_{profile}_x{SCALE_FACTOR}_{MODEL_SHORT}.mkv")
+    # FINAL_VIDEO_FILE_BASE is the name without the fps/rife suffix, which is
+    # appended later once source_fps_float and args.no_rife are both known.
+    FINAL_VIDEO_FILE_BASE = os.path.join(OUTPUT_DIR, f"{input_basename}_{profile}_x{SCALE_FACTOR}_{MODEL_SHORT}")
     ORIGINAL_AUDIO_FILE = os.path.join(PROCESSING_DIR, f"{input_basename}_original.mka")  # .mka accepts any codec (AC-3, AAC, PCM, MP3)
     ORIGINAL_AUDIO_FILE_MP3 = os.path.join(PROCESSING_DIR, f"{input_basename}_original.mp3")  # fallback path
 
@@ -593,7 +623,7 @@ def main(args):
     print(f"Detected Input Extension: {INPUT_EXT}")
     print(f"Selected Scale Factor: {SCALE_FACTOR}x")
     print(f"Selected Model: {REALSRGAN_MODEL}")
-    print(f"Final Output File: {FINAL_VIDEO_FILE}")
+    print(f"Final Output File: (determined after FPS detection)")
 
     # --- Check if processing_chunks contains data from a different video/scale ---
     metadata_file = os.path.join(PROCESSING_DIR, "metadata.json")
@@ -607,6 +637,10 @@ def main(args):
         "no_rife": args.no_rife,
     }
     
+    # is_resume is set True only when metadata existed and matched exactly,
+    # confirming we are continuing an interrupted run with completed chunks.
+    is_resume = False
+
     if os.path.exists(metadata_file):
         # Attempt to read and parse the metadata file.
         # Any failure (corrupt JSON, permission error, etc.) is treated as an
@@ -647,37 +681,104 @@ def main(args):
                     print(f"  To reset:  rm -rf {PROCESSING_DIR}")
                     sys.exit(1)
 
-        elif old_metadata != current_metadata:
-            print(f"\n⚠️  WARNING: processing_chunks contains data from a different job:")
-            print(f"  Old: {old_metadata}")
-            print(f"  New: {current_metadata}")
+        else:
+            # Compare metadata excluding chunk_duration, which is added to
+            # current_metadata only after autotune runs. Stored metadata may
+            # contain it from a previous run; excluding it from both sides
+            # prevents a false mismatch on resume.
+            comparable_keys = [k for k in current_metadata if k != "chunk_duration"]
+            old_comparable = {k: old_metadata.get(k) for k in comparable_keys}
+            new_comparable = {k: current_metadata[k] for k in comparable_keys}
 
-            if args.force:
-                print("Deleting old chunks... (--force specified)")
-                safe_rmtree(PROCESSING_DIR)
+            if old_comparable == new_comparable:
+                # Core parameters matched — this is a resume of an existing run.
+                is_resume = True
             else:
-                response = input("Delete old chunks and start fresh? (y/n): ")
-                if response.lower() == 'y':
-                    print("Deleting old chunks...")
+                # Genuine mismatch — processing_chunks belongs to a different job.
+                # Never offer a simple y/n delete prompt: completed chunks may
+                # represent days of processing. Deletion requires --force to be
+                # passed explicitly on the command line as a deliberate act.
+                print(f"\n[!] ERROR: processing_chunks contains data from a different job.")
+                print(f"  Existing job: {old_metadata}")
+                print(f"  Current job:  {current_metadata}")
+                print(f"")
+                print(f"  The existing chunks in processing_chunks/ belong to a different run.")
+                print(f"  To avoid accidental data loss, deletion requires --force.")
+                print(f"")
+                print(f"  Options:")
+                print(f"    1. Move or rename processing_chunks/ to preserve the existing work,")
+                print(f"       then re-run this command.")
+                print(f"    2. Run with --force to delete the existing chunks and start fresh.")
+                if args.force:
+                    print("\n[INFO] --force specified — deleting existing chunks and starting fresh.")
                     safe_rmtree(PROCESSING_DIR)
                 else:
-                    print("Exiting to avoid mixing chunks from different videos.")
                     sys.exit(1)
     
-    # Save current metadata (includes input_video, scale_factor, profile)
     os.makedirs(PROCESSING_DIR, exist_ok=True)
-    with open(metadata_file, 'w') as f:
-        json.dump(current_metadata, f, indent=4)
+    # Metadata is written after autotune sets chunk_duration (below).
     # --- End of metadata check ---
 
     # --- Step 0: Setup, Auto-Tune, and Splitting ---
     print("\n--- 0. Setup and Splitting ---")
-    CHUNK_DURATION_SECONDS = autotune_chunk_size(INPUT_VIDEO, SCALE_FACTOR)
 
     os.makedirs(INPUT_CHUNKS_DIR, exist_ok=True)
     os.makedirs(ESRGAN_CHUNKS_DIR, exist_ok=True)
     os.makedirs(RIFE_CHUNKS_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    completed_rife_chunks = glob.glob(os.path.join(RIFE_CHUNKS_DIR, "*_rife.mp4"))
+
+    # On a resume, always use the stored chunk_duration regardless of whether
+    # any rife chunks exist yet. The input split (if it happened) used that
+    # size; a different autotune result would produce different boundaries and
+    # corrupt the output. If chunk_duration is absent from old metadata (runs
+    # predating this field), fall through to autotune as a safe fallback.
+    if is_resume and old_metadata.get("chunk_duration"):
+        CHUNK_DURATION_SECONDS = old_metadata["chunk_duration"]
+        print(f"[INFO] Resuming with stored chunk duration: {CHUNK_DURATION_SECONDS}s "
+              f"({len(completed_rife_chunks)} chunks already completed).")
+        print("[INFO] Skipping autotune — chunk size must match the existing split.")
+        # Warn if disk space is tight for the stored chunk size, but never
+        # suggest deleting existing work — the user must free space themselves.
+        try:
+            free_disk_gb = check_disk_space(".", 10)
+            fps = float(get_video_fps(INPUT_VIDEO))
+            in_width, in_height = get_video_dimensions(INPUT_VIDEO)
+            out_width, out_height = in_width * SCALE_FACTOR, in_height * SCALE_FACTOR
+            bytes_per_pixel = 3
+            est_png_mb = (out_width * out_height * bytes_per_pixel * EST_PNG_COMP_RATIO) / (1024**2)
+            mb_per_sec = fps * 2 * est_png_mb
+            needed_gb = (CHUNK_DURATION_SECONDS * mb_per_sec) / (DISK_SAFETY_MARGIN * 1024)
+            if free_disk_gb < needed_gb:
+                print(f"\n⚠️  WARNING: Low disk space for resumed run.")
+                print(f"    Stored chunk size ({CHUNK_DURATION_SECONDS}s) requires ~{needed_gb:.1f} GB free.")
+                print(f"    Available: {free_disk_gb:.2f} GB free at current path.")
+                print(f"    Free up at least {needed_gb - free_disk_gb:.1f} GB before continuing.")
+                print(f"    DO NOT delete processing_chunks/ — your completed chunks are there.")
+                response = input("    Continue anyway? (y/n): ")
+                if response.lower() != "y":
+                    print("    Exiting. Free disk space and retry.")
+                    sys.exit(0)
+        except Exception:
+            pass  # disk check failure is non-fatal on resume
+    else:
+        CHUNK_DURATION_SECONDS = autotune_chunk_size(INPUT_VIDEO, SCALE_FACTOR)
+
+    # Add chunk_duration now that autotune has run, then write metadata
+    # only if the content has changed. On a clean resume the file already
+    # contains the correct values — rewriting it unnecessarily changes its
+    # mtime and makes it look like something changed when nothing did.
+    current_metadata["chunk_duration"] = CHUNK_DURATION_SECONDS
+    _existing_metadata = None
+    try:
+        with open(metadata_file, "r") as f:
+            _existing_metadata = json.load(f)
+    except Exception:
+        pass
+    if _existing_metadata != current_metadata:
+        with open(metadata_file, "w") as f:
+            json.dump(current_metadata, f, indent=4)
 
     duration = get_video_duration(INPUT_VIDEO)
     source_fps_str = get_video_fps(INPUT_VIDEO)
@@ -696,9 +797,47 @@ def main(args):
         print("      - Re-run prepare_video.sh with bwdif mode=0 to get a 30fps master")
         sys.exit(1)
 
+    # Informational prompt for --no-rife on a ~30fps (mode=0) master.
+    # On a fresh run: explain the tradeoff and ask for confirmation.
+    # On a resume (metadata matched): print a brief reminder only — the user
+    # already confirmed this choice when the run was originally started, and
+    # prompting again risks an accidental 'n' aborting a multi-day resume.
+    # --force bypasses the confirmation for non-interactive/scripted use.
+    if args.no_rife and source_fps_float <= 45:
+        print(f"\n[INFO] --no-rife on a ~{source_fps_float:.3f}fps (mode=0) master.")
+        print("    bwdif mode=0 has already combined both interlaced fields into full-resolution")
+        print("    progressive frames, so all available source data is present.")
+        print("    Output will be ~30fps upscaled. RIFE frame doubling will be skipped.")
+        print("    ESRGAN processes the 30fps frame count — half the cost of a mode=1 master.")
+        if is_resume:
+            print("    [Resuming previous run — confirmation skipped.]")
+        elif args.force:
+            print("    Proceeding (--force specified).")
+        else:
+            print("")
+            print("    Alternative: prepare_video.sh --mode1 produces a 60fps master where each")
+            print("    field becomes its own frame, preserving field-rate temporal resolution.")
+            print("    Use --no-rife with that master for 60fps output at 2x ESRGAN cost.")
+            print("")
+            response = input("    Proceed with 30fps upscale, no interpolation? (y/n): ")
+            if response.lower() != "y":
+                print("    Exiting. Add --force to bypass this prompt in future runs.")
+                sys.exit(0)
+
     # With RIFE enabled, output is double the source rate.
     # With --no-rife, output matches source rate exactly.
     output_fps_float = source_fps_float if args.no_rife else source_fps_float * 2
+
+    # Build output filename suffix reflecting fps and interpolation method:
+    #   mode=0 + RIFE (default):  _60fps_rife  (29.97fps input doubled to 59.94fps)
+    #   mode=0 + no-rife:         _30fps        (29.97fps input, no interpolation)
+    #   mode=1 + no-rife:         _60fps        (59.94fps input, no interpolation)
+    if args.no_rife:
+        fps_suffix = "_60fps" if source_fps_float > 45 else "_30fps"
+    else:
+        fps_suffix = "_60fps_rife"
+    FINAL_VIDEO_FILE = f"{FINAL_VIDEO_FILE_BASE}{fps_suffix}.mkv"
+    print(f"Final Output File: {FINAL_VIDEO_FILE}")
 
     # --- Deferred profile selection (requires source_fps_float) ---
     # 60fps masters (bwdif mode=1) use halved temporal hqdn3d values to avoid
@@ -776,10 +915,16 @@ def main(args):
 
     # Use dynamic extension for chunk file pattern
     chunk_file_pattern = os.path.join(INPUT_CHUNKS_DIR, f"chunk_%03d{INPUT_EXT}")
-    if not os.path.exists(os.path.join(INPUT_CHUNKS_DIR, f"chunk_000{INPUT_EXT}")):
+    # Never re-split if completed rife chunks exist. A re-split at a different
+    # chunk size would produce different boundaries, causing overlap or gaps
+    # when the new input chunks are concatenated with existing rife chunks.
+    if completed_rife_chunks:
+        print(f"Chunks already split and {len(completed_rife_chunks)} rife chunks complete — "
+              f"skipping split to preserve existing boundaries.")
+    elif not os.path.exists(os.path.join(INPUT_CHUNKS_DIR, f"chunk_000{INPUT_EXT}")):
         print(f"Splitting video into chunks (video only, extension {INPUT_EXT})...")
         cmd_split = [
-            "ffmpeg", "-i", INPUT_VIDEO, 
+            "ffmpeg", "-i", INPUT_VIDEO,
             "-an", "-c:v", "copy", "-map", "0:v",
             "-segment_time", str(CHUNK_DURATION_SECONDS),
             "-f", "segment", "-reset_timestamps", "1",
@@ -787,7 +932,73 @@ def main(args):
         ]
         subprocess.run(cmd_split, check=True)
     else:
-        print("Chunks already exist, skipping split.")
+        print("Input chunks already exist, skipping split.")
+
+    # --- Chunk Coverage Check ---
+    # Verify that the combined duration of all input chunks and completed rife
+    # chunks accounts for the full source video. This catches split problems
+    # (overlap, gaps, mixed chunk sizes) before committing to hours of ESRGAN.
+    #
+    # On a fresh run: all chunks are in 0_input_chunks/.
+    # On a resume: completed chunks have been deleted from 0_input_chunks/ and
+    # their processed counterparts are in 2_rife_chunks/. We sum both.
+    #
+    # Tolerance: ffmpeg's segment splitter cuts on keyframe boundaries so the
+    # last chunk is typically a few seconds short and all other boundaries may
+    # drift slightly. We allow up to CHUNK_DURATION_SECONDS of underage (one
+    # short last chunk is normal) but flag any overage above a small threshold
+    # (overlap) or underage larger than one full chunk (missing content).
+    print("\n  > Verifying chunk coverage...")
+    try:
+        input_chunk_files = sorted(glob.glob(os.path.join(INPUT_CHUNKS_DIR, f"*{INPUT_EXT}")))
+        rife_chunk_files  = sorted(glob.glob(os.path.join(RIFE_CHUNKS_DIR, "*_rife.mp4")))
+        all_chunk_files = input_chunk_files + rife_chunk_files
+
+        if not all_chunk_files:
+            print("  > No chunks found — coverage check skipped (fresh run, split not yet done).")
+        else:
+            chunks_total_sec = sum(
+                float(subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", f],
+                    capture_output=True, text=True, check=True
+                ).stdout.strip())
+                for f in all_chunk_files
+            )
+            diff = chunks_total_sec - duration
+            overage_threshold  =  2.0  # seconds — anything above this is overlap
+            underage_threshold = CHUNK_DURATION_SECONDS + 2.0  # one short chunk is normal
+
+            h = int(chunks_total_sec // 3600)
+            m = int((chunks_total_sec % 3600) // 60)
+            s = int(chunks_total_sec % 60)
+            src_h = int(duration // 3600)
+            src_m = int((duration % 3600) // 60)
+            src_s = int(duration % 60)
+            print(f"  > Source duration:  {src_h:02d}:{src_m:02d}:{src_s:02d} ({duration:.2f}s)")
+            print(f"  > Chunks total:     {h:02d}:{m:02d}:{s:02d} ({chunks_total_sec:.2f}s) "
+                  f"[{len(input_chunk_files)} input + {len(rife_chunk_files)} rife]")
+            print(f"  > Difference:       {diff:+.2f}s")
+
+            if diff > overage_threshold:
+                raise RuntimeError(
+                    f"Chunk coverage OVERAGE: chunks sum to {diff:.1f}s MORE than source.\n"
+                    f"This indicates overlapping chunk boundaries — likely caused by a\n"
+                    f"re-split at a different chunk size. Delete processing_chunks/ and\n"
+                    f"start fresh, or manually remove the overlapping chunks."
+                )
+            elif diff < -underage_threshold:
+                raise RuntimeError(
+                    f"Chunk coverage UNDERAGE: chunks sum to {abs(diff):.1f}s LESS than source.\n"
+                    f"This indicates missing chunks — the split may be incomplete.\n"
+                    f"Delete processing_chunks/ and start fresh."
+                )
+            else:
+                print(f"  > Coverage check passed.")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print(f"  > WARNING: Coverage check failed ({e}) — continuing anyway.")
 
     # --- Steps 1 & 2: Process Chunks in a Loop ---
     print("\n--- 1. & 2. Processing All Chunks ---")
@@ -1192,11 +1403,19 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_arguments()
+    # Module-level variable so the KeyboardInterrupt handler can print the
+    # resume command even though RECONSTRUCTED_CMD is built inside main().
+    _resume_cmd: str = " ".join(shlex.quote(arg) for arg in sys.argv)
     try:
         main(args)
     except subprocess.CalledProcessError as e:
         print(f"\nA critical command failed. Exiting.")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\nProcess interrupted by user. Exiting.")
+        print("\n\n⏸️  INTERRUPTED: Ctrl+C detected.")
+        print("    Any chunk currently in progress has been abandoned.")
+        print("    Completed chunks are safe and will be resumed automatically.")
+        print("    On next run the pipeline will skip completed chunks and")
+        print("    reprocess the interrupted chunk from the beginning.")
+        print(f"    Resume command:\n      {_resume_cmd}")
         sys.exit(1)

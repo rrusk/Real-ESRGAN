@@ -378,8 +378,8 @@ Examples:
   %(prog)s video.avi --profile halo          # halo/ringing suppression
   %(prog)s video.avi --profile dv            # optimised for MiniDV/Digital8/DV AVI sources
   %(prog)s video.avi --profile hi8dv         # Hi8 tape via Digital8/FireWire direct capture
-  %(prog)s video.mp4 --no-rife              # 30fps mode=0 master: upscale only, 30fps out, half the ESRGAN cost of mode=1
-  %(prog)s video_60fps.mp4 --no-rife        # 60fps mode=1 master: full field-rate temporal resolution, 60fps out
+  %(prog)s video_60fps.mp4                   # 60fps mode=1 master: upscale only, 60fps out (default)
+  %(prog)s video_30fps.mp4 --rife            # 30fps mode=0 master: RIFE doubles to ~60fps out
   %(prog)s camcorder.mp4                    # works with DV, Hi8, and other camcorder formats
   %(prog)s video.avi --model realesr-general-x4v3   # use general degradation model at 2x output
   %(prog)s video.avi -s 4 --model realesr-general-x4v3  # general model at 4x output
@@ -422,7 +422,7 @@ Pre-filter profiles (--profile):
     )
     parser.add_argument(
         "--profile",
-        choices=["balanced", "aggressive", "halo", "dv", "hi8dv"],
+        choices=["balanced", "aggressive", "halo", "dv", "hi8dv", "vhsdv", "vhsdv_composite"],
         default="balanced",
         help=(
             "Pre-filter profile (default: balanced). "
@@ -454,18 +454,16 @@ Pre-filter profiles (--profile):
         help="Maximum runtime in hours before graceful shutdown. Script will not start a new chunk if (elapsed time + last chunk duration) would exceed this limit. Example: --max-runtime 8"
     )
     parser.add_argument(
-        "--no-rife",
-        action="store_true",
-        default=False,
+        "--rife",
+        dest="no_rife",
+        action="store_false",
+        default=True,
         help=(
-            "Skip RIFE frame interpolation. Output FPS matches input FPS. "
-            "Two valid uses: "
-            "(1) 30fps mode=0 master: upscale only, no frame doubling, half the ESRGAN "
-            "cost of the mode=1 path. bwdif mode=0 has already combined both fields into "
-            "full-resolution frames so all source data is present. "
-            "(2) 60fps mode=1 master (prepare_video.sh --mode1): preserves field-rate "
-            "temporal resolution at 2x ESRGAN cost. RIFE is blocked on ~60fps input "
-            "without this flag to prevent accidental 120fps output."
+            "Enable RIFE frame interpolation (disabled by default). Doubles output FPS. "
+            "Intended for ~30fps (bwdif mode=0) masters where RIFE interpolates between "
+            "frames to produce ~60fps output. Do NOT use on ~60fps (bwdif mode=1) masters — "
+            "that would produce ~120fps output. The pipeline will abort if --rife is passed "
+            "with a >45fps input."
         )
     )
     return parser.parse_args()
@@ -532,6 +530,16 @@ def main(args):
     #     Temporal at 5:5 (lighter than balanced) since MPEG-2 compression
     #     flicker is gone; only genuine Hi8 tape noise remains.
     #
+    #   vhsdv      hqdn3d=2.5:3:5:5, pp=ac, unsharp=3:3:0.2
+    #     For VHS tape via TRV330 passthrough using S-Video input. Slightly
+    #     stronger chroma spatial denoise (3 vs 2) vs hi8dv to address VHS
+    #     color-under chroma noise. Same temporal values as hi8dv.
+    #
+    #   vhsdv_composite  hqdn3d=2.5:3.5:5:5, pp=ac, unsharp=3:3:0.2
+    #     For VHS tape via TRV330 passthrough using composite input. Elevated
+    #     chroma spatial (3.5) targets dot crawl and cross-colour artifacts
+    #     introduced by comb filter luma/chroma separation.
+    #
     # 60fps profiles (bwdif mode=1 masters, source > 45fps):
     #   Temporal values halved vs. 30fps counterparts. All other values identical.
     #
@@ -542,22 +550,32 @@ def main(args):
     #   hi8dv      hqdn3d=2:2:2.5:2.5, pp=ac, unsharp=3:3:0.2
 
     PROFILES_30FPS = {
-        "balanced":   "hqdn3d=2:2:6:6,pp=fd,unsharp=3:3:0.2",
-        "aggressive": "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
-        "halo":       "hqdn3d=4:4:8:8,pp=fd,unsharp=3:3:0.2",
-        "dv":         "hqdn3d=1.5:1.5:4:4,pp=ac,unsharp=3:3:0.25",
-        "hi8dv":      "hqdn3d=2:2:5:5,pp=ac,unsharp=3:3:0.2",
+        "balanced":        "hqdn3d=2:2:6:6,pp=fd,unsharp=3:3:0.2",
+        "aggressive":      "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
+        "halo":            "hqdn3d=4:4:8:8,pp=fd,unsharp=3:3:0.2",
+        "dv":              "hqdn3d=1.5:1.5:4:4,pp=ac,unsharp=3:3:0.25",
+        "hi8dv":           "hqdn3d=2:2:5:5,pp=ac,unsharp=3:3:0.2",
+        # VHS via TRV330 passthrough (S-Video input).
+        # Slightly stronger chroma spatial denoise (3 vs 2) vs hi8dv to
+        # address VHS color-under chroma noise. Temporal values match hi8dv.
+        "vhsdv":           "hqdn3d=2.5:3:5:5,pp=ac,unsharp=3:3:0.2",
+        # VHS via TRV330 passthrough (composite input).
+        # Elevated chroma spatial (3.5) targets dot crawl and cross-colour
+        # artifacts introduced by comb filter luma/chroma separation.
+        "vhsdv_composite": "hqdn3d=2.5:3.5:5:5,pp=ac,unsharp=3:3:0.2",
     }
 
     # Temporal hqdn3d values (luma_tmp:chroma_tmp) halved for 60fps field-rate
     # masters. At twice the frame rate, consecutive frames are closer in time,
     # so the same temporal strength would over-smooth genuine motion.
     PROFILES_60FPS = {
-        "balanced":   "hqdn3d=2:2:3:3,pp=fd,unsharp=3:3:0.2",
-        "aggressive": "hqdn3d=3:3:3:3,pp=ac,unsharp=3:3:0.6",
-        "halo":       "hqdn3d=4:4:4:4,pp=fd,unsharp=3:3:0.2",
-        "dv":         "hqdn3d=1.5:1.5:2:2,pp=ac,unsharp=3:3:0.25",
-        "hi8dv":      "hqdn3d=2:2:2.5:2.5,pp=ac,unsharp=3:3:0.2",
+        "balanced":        "hqdn3d=2:2:3:3,pp=fd,unsharp=3:3:0.2",
+        "aggressive":      "hqdn3d=3:3:3:3,pp=ac,unsharp=3:3:0.6",
+        "halo":            "hqdn3d=4:4:4:4,pp=fd,unsharp=3:3:0.2",
+        "dv":              "hqdn3d=1.5:1.5:2:2,pp=ac,unsharp=3:3:0.25",
+        "hi8dv":           "hqdn3d=2:2:2.5:2.5,pp=ac,unsharp=3:3:0.2",
+        "vhsdv":           "hqdn3d=2.5:3:2.5:2.5,pp=ac,unsharp=3:3:0.2",
+        "vhsdv_composite": "hqdn3d=2.5:3.5:2.5:2.5,pp=ac,unsharp=3:3:0.2",
     }
 
     profile = args.profile
@@ -571,8 +589,12 @@ def main(args):
                       "Use if you see white ghost lines around dark edges.",
         "dv":         "Light spatial denoise, moderate temporal smoothing, full deblock+dering, gentle sharpen. "
                       "Optimised for MiniDV / Digital8 / DV AVI sources.",
-        "hi8dv":      "Light spatial denoise, moderate temporal smoothing, full deblock+dering, minimal sharpen. "
-                      "Optimised for Hi8 tape via Digital8/FireWire direct DV capture.",
+        "hi8dv":           "Light spatial denoise, moderate temporal smoothing, full deblock+dering, minimal sharpen. "
+                           "Optimised for Hi8 tape via Digital8/FireWire direct DV capture.",
+        "vhsdv":           "Slightly stronger chroma spatial denoise vs hi8dv to address VHS color-under noise. "
+                           "For VHS via TRV330 passthrough using S-Video input.",
+        "vhsdv_composite": "Elevated chroma spatial denoise targeting dot crawl and cross-colour from comb filter "
+                           "luma/chroma separation. For VHS via TRV330 passthrough using composite input.",
     }
 
     # Calculate FFmpeg thread count
@@ -785,59 +807,31 @@ def main(args):
     source_fps_float = float(source_fps_str)
 
     # Guard: ~60fps input + RIFE would produce ~120fps output, which is never
-    # the intent. This indicates a bwdif mode=1 master was passed in without
-    # --no-rife. Abort early with a clear message rather than silently producing
+    # the intent. This indicates a bwdif mode=1 master was passed in with
+    # --rife. Abort early with a clear message rather than silently producing
     # a 120fps file after hours of processing.
     if source_fps_float > 45 and not args.no_rife:
         print(f"\n[!] ERROR: Input is ~{source_fps_float:.3f}fps (bwdif mode=1 master) "
-              f"but --no-rife was not specified.")
+              f"but --rife was specified.")
         print("    Running RIFE on a 60fps master would produce ~120fps output.")
         print("    Either:")
-        print("      - Add --no-rife to process at 60fps without interpolation")
-        print("      - Re-run prepare_video.sh with bwdif mode=0 to get a 30fps master")
+        print("      - Remove --rife to process at 60fps without interpolation (default)")
+        print("      - Re-run prepare_video.sh with --mode0 to get a 30fps master, then use --rife")
         sys.exit(1)
 
-    # Informational prompt for --no-rife on a ~30fps (mode=0) master.
-    # On a fresh run: explain the tradeoff and ask for confirmation.
-    # On a resume (metadata matched): print a brief reminder only — the user
-    # already confirmed this choice when the run was originally started, and
-    # prompting again risks an accidental 'n' aborting a multi-day resume.
-    # --force bypasses the confirmation for non-interactive/scripted use.
-    if args.no_rife and source_fps_float <= 45:
-        print(f"\n[INFO] --no-rife on a ~{source_fps_float:.3f}fps (mode=0) master.")
-        print("    bwdif mode=0 has already combined both interlaced fields into full-resolution")
-        print("    progressive frames, so all available source data is present.")
-        print("    Output will be ~30fps upscaled. RIFE frame doubling will be skipped.")
-        print("    ESRGAN processes the 30fps frame count — half the cost of a mode=1 master.")
-        if is_resume:
-            print("    [Resuming previous run — confirmation skipped.]")
-        elif args.force:
-            print("    Proceeding (--force specified).")
-        else:
-            print("")
-            print("    Alternative: prepare_video.sh --mode1 produces a 60fps master where each")
-            print("    field becomes its own frame, preserving field-rate temporal resolution.")
-            print("    Use --no-rife with that master for 60fps output at 2x ESRGAN cost.")
-            print("")
-            response = input("    Proceed with 30fps upscale, no interpolation? (y/n): ")
-            if response.lower() != "y":
-                print("    Exiting. Add --force to bypass this prompt in future runs.")
-                sys.exit(0)
-
     # With RIFE enabled, output is double the source rate.
-    # With --no-rife, output matches source rate exactly.
+    # With --no-rife (default), output matches source rate exactly.
     output_fps_float = source_fps_float if args.no_rife else source_fps_float * 2
 
     # Build output filename suffix reflecting fps and interpolation method:
-    #   mode=0 + RIFE (default):  _60fps_rife  (29.97fps input doubled to 59.94fps)
-    #   mode=0 + no-rife:         _30fps        (29.97fps input, no interpolation)
-    #   mode=1 + no-rife:         _60fps        (59.94fps input, no interpolation)
+    #   mode=1 (default, no-rife): _60fps       (59.94fps input, no interpolation)
+    #   mode=0 + --rife:           _60fps_rife   (29.97fps input doubled to 59.94fps)
+    #   mode=0 + no-rife:          _30fps        (29.97fps input, no interpolation)
     if args.no_rife:
         fps_suffix = "_60fps" if source_fps_float > 45 else "_30fps"
     else:
         fps_suffix = "_60fps_rife"
     FINAL_VIDEO_FILE = f"{FINAL_VIDEO_FILE_BASE}{fps_suffix}.mkv"
-    print(f"Final Output File: {FINAL_VIDEO_FILE}")
 
     # --- Deferred profile selection (requires source_fps_float) ---
     # 60fps masters (bwdif mode=1) use halved temporal hqdn3d values to avoid
@@ -849,20 +843,64 @@ def main(args):
     else:
         prefilter_vf = PROFILES_30FPS[profile]
         fps_label = "30fps"
-    print(f"   [Profile filter] {profile} ({fps_label} variant): {prefilter_vf}")
 
     source_sar = get_video_sar(INPUT_VIDEO)
+    total_chunks = math.ceil(duration / CHUNK_DURATION_SECONDS)
+
+    # --- Pre-Flight Plan ---
+    # Always printed so the user can verify settings before hours of processing.
+    # On a resume the plan is shown as a reminder; confirmation is skipped because
+    # the user already approved it when the run was originally started, and
+    # prompting again risks an accidental 'n' aborting a multi-day job.
+    # --force bypasses confirmation for non-interactive / scripted use.
+    print(f"\n{'=' * 55}")
+    print(f"  PRE-FLIGHT PLAN")
+    print(f"{'=' * 55}")
+    print(f"  Input:         {INPUT_VIDEO}")
+    print(f"  Input FPS:     {source_fps_str} ({fps_label} variant profile)")
+    print(f"  Input SAR:     {source_sar if source_sar else '1:1 (square pixels)'}")
+    print(f"  Duration:      {duration:.1f}s  →  {total_chunks} chunks × {CHUNK_DURATION_SECONDS}s")
+    print(f"  Scale:         {SCALE_FACTOR}x  ({REALSRGAN_MODEL})")
+    print(f"  Profile:       {profile}  →  {prefilter_vf}")
+    print(f"  RIFE:          {'enabled (--rife): frames will be doubled' if not args.no_rife else 'disabled (default)'}")
+    print(f"  Output FPS:    {output_fps_float:.3f}")
+    print(f"  Output file:   {FINAL_VIDEO_FILE}")
+
+    # Warn prominently when the output will not be ~60fps — this is the most
+    # common configuration mistake and can waste hours of processing time.
+    if output_fps_float < 50:
+        print(f"\n  ⚠️  WARNING: Output will be {output_fps_float:.3f}fps — NOT ~60fps.")
+        if args.no_rife and source_fps_float <= 45:
+            print(f"     This is a ~30fps input with RIFE disabled.")
+            print(f"     For ~60fps output, either:")
+            print(f"       (a) Re-prepare with prepare_video.sh (default mode=1) → re-run pipeline, or")
+            print(f"       (b) Add --rife to interpolate this 30fps master to ~60fps.")
+    print(f"{'=' * 55}\n")
+
+    if is_resume:
+        print("[INFO] Resuming previous run — confirmation skipped.")
+    elif args.force:
+        print("[INFO] --force specified — skipping confirmation.")
+    else:
+        response = input("  Proceed? (y/n): ")
+        if response.lower() != "y":
+            print("  Exiting. Add --force to bypass this prompt in future runs.")
+            sys.exit(0)
+
+    # Emit final-output-file line after confirmation so it appears in the log
+    # at the point processing actually begins (consistent with prior behaviour).
+    print(f"Final Output File: {FINAL_VIDEO_FILE}")
+    print(f"   [Profile filter] {profile} ({fps_label} variant): {prefilter_vf}")
     if source_sar:
         print(f"Source SAR detected: {source_sar} (non-square pixels — will be preserved in final output.)")
     else:
         print(f"Source SAR: 1:1 (square pixels)")
-    total_chunks = math.ceil(duration / CHUNK_DURATION_SECONDS)
     print(f"Video detected: {duration:.2f}s, {source_fps_str} FPS.")
     print(f"Using {CHUNK_DURATION_SECONDS}s chunks, splitting into {total_chunks} total chunks.")
     if args.no_rife:
-        print(f"RIFE disabled (--no-rife): output will be {output_fps_float:.3f} FPS (matches input).")
+        print(f"RIFE disabled (default): output will be {output_fps_float:.3f} FPS (matches input).")
     else:
-        print(f"RIFE enabled: output will be {output_fps_float:.3f} FPS (2x input).")
+        print(f"RIFE enabled (--rife): output will be {output_fps_float:.3f} FPS (2x input).")
 
     # Also accept a previously extracted .mp3 fallback from an earlier run
     if os.path.exists(ORIGINAL_AUDIO_FILE_MP3) and os.path.getsize(ORIGINAL_AUDIO_FILE_MP3) > 0:

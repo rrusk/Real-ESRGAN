@@ -25,7 +25,7 @@ fi
 # 1. Argument Check
 # Validates input count and provides detailed help documentation.
 if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
-    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N] [--mode1]"
+    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N] [--mode0]"
     echo ""
     echo "Arguments:"
     echo "  source_video    Path to the raw AVI, MPG, or MP4 file."
@@ -41,12 +41,22 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "                  Lower = higher quality and larger file."
     echo "                  12-14 recommended for permanent archival masters."
     echo "                  16 is the default and suits AI upscaling pipeline input."
-    echo "  --mode1         (Optional) Use bwdif mode=1 (field-rate output: ~60fps)."
-    echo "                  Default is mode=0 (frame-rate output: ~30fps)."
-    echo "                  Use when you want to preserve full temporal resolution from"
-    echo "                  interlaced sources (one progressive frame per field)."
-    echo "                  Output filename will include '_60fps' to distinguish from"
-    echo "                  mode=0 masters. Pair with --no-rife in video_upscale_pipeline.py."
+    echo "  --mode0         (Optional) Use bwdif mode=0 (frame-rate output: ~30fps)."
+    echo "                  Default is mode=1 (field-rate output: ~60fps)."
+    echo ""
+    echo "                  mode=1 (default): each field becomes its own progressive"
+    echo "                  frame (~60fps), preserving field-rate temporal resolution."
+    echo "                  Best for fast motion where the ~16.7ms between fields matters."
+    echo "                  ESRGAN processes 2x as many frames — expect roughly 2x the"
+    echo "                  upscaling pipeline runtime."
+    echo "                  Always pair mode=1 output with --no-rife in the pipeline."
+    echo ""
+    echo "                  mode=0 (--mode0): combines both interlaced fields into one"
+    echo "                  full-resolution progressive frame (~30fps). All source data"
+    echo "                  is preserved. ESRGAN processes the 30fps frame count."
+    echo ""
+    echo "                  Output filename includes '_30fps' when --mode0 is used,"
+    echo "                  and '_60fps' for the default mode=1."
     echo ""
     echo "How to select mask_pixels:"
     echo "  1. Play your video in VLC and look at the bottom edge."
@@ -59,7 +69,7 @@ fi
 # Strict argument limit check as per previous versions
 if [ "$#" -gt 7 ]; then
     echo "Error: Too many arguments."
-    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N] [--mode1]"
+    echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N] [--mode0]"
     exit 1
 fi
 
@@ -73,7 +83,7 @@ MASK_PIXELS=0
 TEST_MODE=false
 FORCE_AAC=false
 CRF_VALUE=16
-BWDIF_MODE=0   # default: frame-rate output (~30fps); --mode1 sets this to 1 (~60fps)
+BWDIF_MODE=1   # default: field-rate output (~60fps); --mode0 sets this to 0 (~30fps)
 
 # Simple parsing loop to handle optional numeric mask and named flags.
 # Because SOURCE_INPUT has been shifted out, only genuine optional args remain.
@@ -90,8 +100,8 @@ for arg in "$@"; do
         TEST_MODE=true
     elif [[ "$arg" == "--aac" ]]; then
         FORCE_AAC=true
-    elif [[ "$arg" == "--mode1" ]]; then
-        BWDIF_MODE=1
+    elif [[ "$arg" == "--mode0" ]]; then
+        BWDIF_MODE=0
     fi
 done
 
@@ -120,12 +130,13 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 OUTPUT_DIR="outputs"
 mkdir -p "$OUTPUT_DIR"
 
-# Embed fps label in filename when mode=1 so 30fps and 60fps masters can
-# coexist in the outputs directory without overwriting each other.
-if [ "$BWDIF_MODE" -eq 1 ]; then
-    FPS_LABEL="_60fps"
+# Always embed an fps label so masters are self-documenting regardless of which
+# mode was used. Both mode=1 (default, ~60fps) and mode=0 (--mode0, ~30fps)
+# get an explicit suffix so files are never ambiguous in the outputs directory.
+if [ "$BWDIF_MODE" -eq 0 ]; then
+    FPS_LABEL="_30fps"
 else
-    FPS_LABEL=""
+    FPS_LABEL="_60fps"
 fi
 
 if [ "$TEST_MODE" = true ]; then
@@ -286,7 +297,12 @@ if [ "$IS_INTERLACED" = true ]; then
     echo -e "\n⚠️  WARNING: Deinterlacing is a CPU-intensive process."
     echo "    Depending on video length, this will take quite awhile."
     if [ "$BWDIF_MODE" -eq 1 ]; then
-        echo "    NOTE: mode=1 output is ~60fps. Use --no-rife in video_upscale_pipeline.py."
+        echo "    NOTE: mode=1 output is ~60fps (one frame per field)."
+        echo "          ESRGAN will process 2x as many frames — expect ~2x upscaling runtime."
+        echo "          Always pair with --no-rife in video_upscale_pipeline.py."
+    else
+        echo "    NOTE: mode=0 output is ~30fps. Both fields combined into full-resolution"
+        echo "          progressive frames. Use the default (mode=1) for field-rate 60fps output."
     fi
 else
     VIDEO_PLAN="Progressive Copy (No deinterlacing needed)"
@@ -306,10 +322,10 @@ if [ "$IS_INTERLACED" = true ]; then
     echo -e "\n--- Step 2: High-Quality Deinterlacing (${FIELD_ORDER}) ---"
 
     # Filter Chain: bwdif mode=$BWDIF_MODE, yuv420p format, and optional drawbox.
-    #   mode=0 (default): frame-rate output — one progressive frame per interlaced frame (~30fps).
-    #   mode=1 (--mode1): field-rate output — one progressive frame per field (~60fps).
+    #   mode=1 (default): field-rate output — one progressive frame per field (~60fps).
     #                     Preserves full temporal resolution; pair with --no-rife in the
     #                     upscale pipeline to avoid accidental 120fps output.
+    #   mode=0 (--mode0): frame-rate output — one progressive frame per interlaced frame (~30fps).
     FILTER_CHAIN="bwdif=mode=${BWDIF_MODE}:parity=${PARITY}:deint=0,format=yuv420p"
     if [ "$MASK_PIXELS" -gt 0 ]; then
         echo "Applying mask: Bottom $MASK_PIXELS pixels"

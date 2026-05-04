@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 # video_upscale_pipeline.py - Upscale and interpolate legacy video (VHS, Hi8, DV camcorder, etc.)
 # Uses Real-ESRGAN for upscaling and RIFE for frame interpolation.
+#
+# ==============================================================================
+# CHANGE HISTORY — CRF VALUES
+# ==============================================================================
+# 2026-05-04: Raised intermediate CRF values for archival quality.
+#             ALL previously processed videos used CRF 16 for both intermediates:
+#
+#               Pre-filter intermediate (fed to Real-ESRGAN):
+#                 Before: CRF 16    After: CRF 12
+#
+#               RIFE frame reassembly intermediate (assembled into final output):
+#                 Before: CRF 17    After: CRF 14
+#
+#             See inline comments at each ffmpeg call for exact locations.
+# ==============================================================================
 import subprocess
 import os
 import shutil
@@ -61,6 +76,38 @@ def safe_rmtree(path):
     """Safely remove a directory tree."""
     if os.path.isdir(path):
         shutil.rmtree(path)
+
+def load_chunk_durations_from_log(log_file):
+    """
+    Reconstruct the full-chunk timing history from pipeline.log.
+
+    Scans for lines of the form written at the end of every successfully
+    completed full chunk::
+
+        "  > Chunk finished in 12345.67 seconds."
+
+    Partial-resume chunks are never logged with this line (they hit
+    ``continue`` before the timing block), so the list naturally contains
+    only the same timings that would have been appended to chunk_durations
+    during the original run — no additional filtering required.
+
+    Returns an empty list if the log does not exist or contains no matches,
+    so callers can treat the result as a plain (possibly empty) list without
+    special-casing.
+    """
+    durations = []
+    _FINISHED_RE = re.compile(r"^\s*>\s+Chunk finished in ([0-9]+(?:\.[0-9]+)?)\s+seconds\.")
+    try:
+        with open(log_file, "r", errors="replace") as fh:
+            for line in fh:
+                m = _FINISHED_RE.match(line)
+                if m:
+                    durations.append(float(m.group(1)))
+    except FileNotFoundError:
+        pass  # first run — log does not exist yet
+    except Exception as e:
+        print(f"  [WARN] Could not read chunk timings from log: {e}")
+    return durations
 
 # --- Logging Helper ---
 LOG_FILE = os.path.join(PROCESSING_DIR, "pipeline.log")
@@ -1049,10 +1096,37 @@ def main(args):
 
     total_start_time = time.time()
     chunks_to_process = total_chunks
-    chunk_durations = []  # Rolling history for median ETA
+    # Rolling history for median ETA.  On a resume, reconstruct from the log
+    # so the first chunk in this session shows an ETA rather than "unknown".
+    if is_resume and os.path.exists(LOG_FILE):
+        chunk_durations = load_chunk_durations_from_log(LOG_FILE)
+        if chunk_durations:
+            print(f"[INFO] Loaded {len(chunk_durations)} prior chunk timing(s) from log "
+                  f"(median: {statistics.median(chunk_durations)/3600:.2f}h).")
+    else:
+        chunk_durations = []
     if TEST_MODE_CHUNKS is not None:
         chunks_to_process = min(total_chunks, TEST_MODE_CHUNKS)
         print(f"*** TEST MODE: Only processing {chunks_to_process} chunk(s) ***")
+
+    # Probe the last input chunk once so every project-completion ETA in the
+    # loop can use (chunks_remaining - 1 + last_chunk_fraction) × median
+    # rather than chunks_remaining × median, which over-estimates whenever the
+    # final chunk is shorter than CHUNK_DURATION_SECONDS (the common case).
+    last_chunk_fraction = 1.0  # assume full chunk if probe fails
+    last_chunk_path = os.path.join(INPUT_CHUNKS_DIR,
+                                   f"chunk_{total_chunks - 1:03d}{INPUT_EXT}")
+    try:
+        _last_sec = float(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", last_chunk_path],
+            capture_output=True, text=True, check=True
+        ).stdout.strip())
+        last_chunk_fraction = min(_last_sec / CHUNK_DURATION_SECONDS, 1.0)
+        print(f"[INFO] Last chunk: {_last_sec:.0f}s / {CHUNK_DURATION_SECONDS}s nominal"
+              f" = {last_chunk_fraction:.2f} of a full chunk.")
+    except Exception:
+        print(f"[INFO] Last chunk size probe failed — ETA will treat it as a full chunk.")
 
     for i in range(chunks_to_process):
         chunk_name = f"chunk_{i:03d}"
@@ -1061,22 +1135,47 @@ def main(args):
         elapsed_hours = (chunk_start_time - total_start_time) / 3600
         print(f"\nProcessing Chunk {i+1} / {total_chunks} ({chunk_name})")
         print(f"  > Started at: {local_start.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+        # Define paths here so the last-chunk ETA probe below can reference input_chunk.
+        input_chunk = os.path.join(INPUT_CHUNKS_DIR, f"{chunk_name}{INPUT_EXT}")
+        esrgan_temp_work_dir = os.path.join(ESRGAN_CHUNKS_DIR, f"{chunk_name}_temp_work")
+        esrgan_output_file = os.path.join(ESRGAN_CHUNKS_DIR, f"{chunk_name}_esrgan.mp4")
+        rife_in_frames_dir = os.path.join(ESRGAN_CHUNKS_DIR, f"{chunk_name}_rife_in_frames")
+        rife_out_frames_dir = os.path.join(RIFE_CHUNKS_DIR, f"{chunk_name}_rife_out_frames")
+        rife_output_file = os.path.join(RIFE_CHUNKS_DIR, f"{chunk_name}_rife.mp4")
+
         if chunk_durations:
-            chunk_eta = local_start + timedelta(seconds=statistics.median(chunk_durations))
-            print(f"  > Estimated completion: {chunk_eta.strftime('%Y-%m-%d %H:%M:%S %Z')} (median {statistics.median(chunk_durations)/3600:.2f}h)")
+            median_sec_pre = statistics.median(chunk_durations)
+            # Last chunk is often shorter than CHUNK_DURATION_SECONDS because
+            # ffmpeg's segment splitter cuts on keyframe boundaries.  Probe the
+            # actual input chunk duration and scale the median proportionally so
+            # the ETA reflects the real remaining work instead of a full chunk.
+            if i == total_chunks - 1:
+                try:
+                    actual_last_sec = float(subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", input_chunk],
+                        capture_output=True, text=True, check=True
+                    ).stdout.strip())
+                    ratio = actual_last_sec / CHUNK_DURATION_SECONDS
+                    eta_sec = median_sec_pre * ratio
+                    chunk_eta = local_start + timedelta(seconds=eta_sec)
+                    print(f"  > Estimated completion: {chunk_eta.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                          f"(last chunk {actual_last_sec:.0f}s / {CHUNK_DURATION_SECONDS}s nominal"
+                          f" → {ratio:.2f}× median {median_sec_pre/3600:.2f}h)")
+                except Exception:
+                    # Probe failed — fall back to unscaled median.
+                    chunk_eta = local_start + timedelta(seconds=median_sec_pre)
+                    print(f"  > Estimated completion: {chunk_eta.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                          f"(median {median_sec_pre/3600:.2f}h, last-chunk size probe failed)")
+            else:
+                chunk_eta = local_start + timedelta(seconds=median_sec_pre)
+                print(f"  > Estimated completion: {chunk_eta.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                      f"(median {median_sec_pre/3600:.2f}h)")
         else:
             print(f"  > Estimated completion: unknown (first chunk)")
         print(f"  > Project elapsed: {elapsed_hours:.2f}h")
         print(f"  > To stop after this chunk: touch {STOP_FILE}")
-
-        # Use dynamic extension for input chunks
-        input_chunk = os.path.join(INPUT_CHUNKS_DIR, f"{chunk_name}{INPUT_EXT}")
-        esrgan_temp_work_dir = os.path.join(ESRGAN_CHUNKS_DIR, f"{chunk_name}_temp_work")
-        esrgan_output_file = os.path.join(ESRGAN_CHUNKS_DIR, f"{chunk_name}_esrgan.mp4")
-        
-        rife_in_frames_dir = os.path.join(ESRGAN_CHUNKS_DIR, f"{chunk_name}_rife_in_frames")
-        rife_out_frames_dir = os.path.join(RIFE_CHUNKS_DIR, f"{chunk_name}_rife_out_frames")
-        rife_output_file = os.path.join(RIFE_CHUNKS_DIR, f"{chunk_name}_rife.mp4")
 
         # Track which steps were skipped so partial-resume chunks are excluded
         # from the median ETA — they represent far less work than a full chunk.
@@ -1111,8 +1210,10 @@ def main(args):
                 "ffmpeg", "-y",
                 "-i", input_chunk,
                 "-vf", prefilter_vf, # "hqdn3d=3:3:6:6,pp=ac,unsharp=3:3:0.6",
-                "-c:v", "libx264", "-threads", str(threads), "-crf", "16", # <-- Quality Fix: CRF 16 for master fidelity
-                "-preset", "slower", # <-- Quality Fix: 'slower' for maximum detail
+                "-c:v", "libx264", "-threads", str(threads), "-crf", "12", # archival: CRF 12 preserves maximum detail for ESRGAN
+                # 2026-05-04: raised from CRF 16 to CRF 12 — all previously processed
+                # videos used CRF 16 for the pre-filter intermediate.
+                "-preset", "fast", # temporary intermediate decoded frame-by-frame: preset does not affect quality
                 "-pix_fmt", "yuv420p",
                 prefiltered_chunk
             ]
@@ -1266,8 +1367,10 @@ def main(args):
                 "-c:v", "libx264",
                 "-threads", str(threads),
                 "-pix_fmt", "yuv420p",
-                "-crf", "17", # <-- Quality Fix: CRF 17 for high-bitrate 4K assembly
-                "-preset", "slower", # <-- Quality Fix: 'slower' for maximum fidelity
+                "-crf", "14", # archival: CRF 14 preserves upscaled 4K detail in chunk before final concat
+                # 2026-05-04: raised from CRF 17 to CRF 14 — all previously processed
+                # videos used CRF 17 for the RIFE frame reassembly intermediate.
+                "-preset", "fast", # temporary intermediate decoded at concat: preset does not affect quality
                 rife_output_file
             ]
             try:
@@ -1307,7 +1410,17 @@ def main(args):
         else:
             median_sec = duration_sec  # fallback if no full chunks yet
         chunks_remaining = total_chunks - (i + 1)
-        eta_project = local_end + timedelta(seconds=median_sec * chunks_remaining)
+
+        # Effective remaining work in full-chunk units:
+        #   (chunks_remaining - 1) full chunks + last_chunk_fraction of a chunk.
+        # When chunks_remaining == 0 this is 0. When the probe failed,
+        # last_chunk_fraction == 1.0 so the formula reduces to chunks_remaining × median.
+        if chunks_remaining > 0:
+            effective_remaining = (chunks_remaining - 1) + last_chunk_fraction
+        else:
+            effective_remaining = 0.0
+        remaining_sec = median_sec * effective_remaining
+        eta_project = local_end + timedelta(seconds=remaining_sec)
 
         print(f"  > Chunk finished in {duration_sec:.2f} seconds.")
         print(f"  > Finished at: {local_end.strftime('%Y-%m-%d %H:%M:%S %Z')}")
@@ -1315,7 +1428,7 @@ def main(args):
         print(f"  > Next chunk ETA (median): {next_eta.strftime('%Y-%m-%d %H:%M:%S %Z')}")
         if chunks_remaining > 0:
             print(f"  > Project completion ETA: {eta_project.strftime('%Y-%m-%d %H:%M:%S %Z')} "
-                  f"({chunks_remaining} chunks × {median_sec/3600:.2f}h median)")
+                  f"({effective_remaining:.2f}× median {median_sec/3600:.2f}h)")
         
         # --- Runtime Limit Check ---
         if args.max_runtime is not None:

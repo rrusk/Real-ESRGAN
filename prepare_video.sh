@@ -8,6 +8,17 @@
 # NOTE: The entire script is wrapped in main() so that bash reads the complete
 # file into memory before execution begins. This prevents mid-run file
 # replacement from affecting an in-progress encode.
+#
+# ==============================================================================
+# CHANGE HISTORY — CRF VALUES
+# ==============================================================================
+# 2026-05-04: All source types now use CRF 12 as the pipeline intermediate.
+#             ALL previously processed files used CRF 16 regardless of source type.
+#
+#             Rationale: as a pipeline intermediate fed to Real-ESRGAN,
+#             maximum input quality applies regardless of source noise floor.
+#             Detail lost at this stage cannot be recovered by upscaling.
+#             See inline comments at each source type block for exact locations.
 # ==============================================================================
 set -euo pipefail
 
@@ -37,10 +48,9 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "                  the default behaviour is to write a .mkv master (which"
     echo "                  supports PCM natively) rather than lossy-encode to AAC."
     echo "                  Use --aac only if you specifically need an MP4 master."
-    echo "  --crf N         (Optional) x264 quality level (default: 16)."
-    echo "                  Lower = higher quality and larger file."
-    echo "                  12-14 recommended for permanent archival masters."
-    echo "                  16 is the default and suits AI upscaling pipeline input."
+    echo "  --crf N         (Optional) x264 CRF quality level (default: 12)."
+    echo "                  12 is the archival default for all SD pipeline intermediates."
+    echo "                  Lower = higher quality and larger file. Rarely needs changing."
     echo "  --mode0         (Optional) Use bwdif mode=0 (frame-rate output: ~30fps)."
     echo "                  Default is mode=1 (field-rate output: ~60fps)."
     echo ""
@@ -82,8 +92,9 @@ shift
 MASK_PIXELS=0
 TEST_MODE=false
 FORCE_AAC=false
-CRF_VALUE=16
-BWDIF_MODE=1   # default: field-rate output (~60fps); --mode0 sets this to 0 (~30fps)
+CRF_VALUE=""       # empty until after prefix detection; --crf sets this explicitly
+CRF_EXPLICIT=false # true when --crf was supplied on the command line
+BWDIF_MODE=1       # default: field-rate output (~60fps); --mode0 sets this to 0 (~30fps)
 
 # Simple parsing loop to handle optional numeric mask and named flags.
 # Because SOURCE_INPUT has been shifted out, only genuine optional args remain.
@@ -91,6 +102,7 @@ _NEXT_IS_CRF=false
 for arg in "$@"; do
     if [[ "$_NEXT_IS_CRF" == true ]]; then
         CRF_VALUE="$arg"
+        CRF_EXPLICIT=true
         _NEXT_IS_CRF=false
     elif [[ "$arg" == "--crf" ]]; then
         _NEXT_IS_CRF=true
@@ -102,8 +114,63 @@ for arg in "$@"; do
         FORCE_AAC=true
     elif [[ "$arg" == "--mode0" ]]; then
         BWDIF_MODE=0
+    else
+        # Reject unrecognised arguments early rather than silently ignoring them.
+        # Common mistake: passing 'test' instead of '--test'.
+        echo "Error: Unrecognised argument: '$arg'" >&2
+        echo "Usage: $0 <source_video> [mask_pixels] [--test] [--aac] [--crf N] [--mode0]" >&2
+        exit 1
     fi
 done
+
+# CRF Validation
+# --crf overrides the default. Validates that the value is a whole number
+# within the x264 range and warns if it seems unreasonable for an SD pipeline
+# intermediate. Hard error above 51 (x264 maximum).
+# Default is CRF 12 for all source types — maximum quality input for
+# Real-ESRGAN regardless of source noise floor (2026-05-04: was CRF 16).
+if [[ "$CRF_EXPLICIT" == false ]]; then
+    CRF_VALUE=12
+fi
+if ! [[ "$CRF_VALUE" =~ ^[0-9]+$ ]]; then
+    echo "Error: --crf requires a whole number (got: '$CRF_VALUE')." >&2
+    exit 1
+fi
+if (( CRF_VALUE > 51 )); then
+    echo "Error: CRF $CRF_VALUE is out of range — x264 maximum is 51." >&2
+    exit 1
+fi
+if (( CRF_VALUE < 10 )); then
+    echo -e "⚠️  WARNING: CRF $CRF_VALUE is very low — files will be very large" \
+            "with negligible quality benefit over CRF 12."
+elif (( CRF_VALUE > 16 )); then
+    echo -e "⚠️  WARNING: CRF $CRF_VALUE is lossy for an SD pipeline intermediate." \
+            "Detail loss will reduce Real-ESRGAN output quality."
+    echo "    Recommended: 12 (default). Use --crf only if you have a specific reason."
+fi
+
+# Early Codec Probe
+# IS_DV_SOURCE is set here for field order detection later in the script.
+# The informational DV messages are emitted after the probe report to keep
+# user-visible output in logical order.
+#
+# DV codec (dvsd, dv25, dvvideo) notes:
+#   - Field order is always BFF on NTSC but ffprobe cannot read it from
+#     the AVI container headers and returns 'unknown'.
+#   - The dvvideo decoder emits 'AC EOB marker is absent' warnings for
+#     malformed frames in the tape leader (garbage timecode region).
+#     These are cosmetic and stop after the first few seconds.
+SOURCE_CODEC=$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$SOURCE_INPUT" 2>/dev/null)
+IS_DV_SOURCE=false
+if [[ "$SOURCE_CODEC" == dv* ]]; then
+    IS_DV_SOURCE=true
+fi
+
+BASE_NAME=$(basename "$SOURCE_INPUT")
+FILE_STEM="${BASE_NAME%.*}"
 
 # Odd Number Sanity Check
 # Prevents chroma artifacts caused by splitting 2x2 color blocks in YUV420p.
@@ -124,8 +191,6 @@ if [[ "${SOURCE_INPUT,,}" == *.iso ]]; then
 fi
 
 # Path and Filename Setup
-BASE_NAME=$(basename "$SOURCE_INPUT")
-FILE_STEM="${BASE_NAME%.*}"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 OUTPUT_DIR="outputs"
 mkdir -p "$OUTPUT_DIR"
@@ -155,23 +220,11 @@ echo "--- Step 1: Probing Video ---"
 PROBE_LOG=$(python3 probe_video.py "$SOURCE_INPUT")
 echo "$PROBE_LOG"
 
-# 3. Detect Source Codec
-# Used for DV-specific field order detection.
-# DV codec (dvsd, dv25, dvvideo) requires special handling:
-#   - Field order is always BFF on NTSC, but ffprobe cannot read it from
-#     the AVI container headers and returns 'unknown'.
-#   - The dvvideo decoder emits 'AC EOB marker is absent' warnings for
-#     malformed frames in the tape leader (garbage timecode region).
-#     These warnings are cosmetic, stop after the first few seconds, and
-#     do not affect the encoded output. They are left unfiltered to preserve
-#     ffmpeg's real-time progress display.
-SOURCE_CODEC=$(ffprobe -v error -select_streams v:0 \
-    -show_entries stream=codec_name \
-    -of default=noprint_wrappers=1:nokey=1 \
-    "$SOURCE_INPUT" 2>/dev/null)
-IS_DV_SOURCE=false
-if [[ "$SOURCE_CODEC" == dv* ]]; then
-    IS_DV_SOURCE=true
+# 3. Emit DV-Specific Info Messages
+# SOURCE_CODEC and IS_DV_SOURCE were set earlier (before prefix detection).
+# Messages are deferred until here so they appear after the probe report
+# in the user-visible output, keeping the log in logical order.
+if [[ "$IS_DV_SOURCE" == true ]]; then
     echo "[INFO] DV codec detected ($SOURCE_CODEC) — BFF field order assumed (NTSC standard)."
     echo "[INFO] Note: 'AC EOB marker' warnings at encode start are normal for DV tape"
     echo "       leader frames and will stop after the first few seconds."
@@ -344,14 +397,17 @@ if [ "$IS_INTERLACED" = true ]; then
     #   host CPU rather than hardcoding a value that may under or over-utilize
     #   available cores.
     #
-    #   -crf defaults to 16, suitable for AI upscaling pipeline input.
-    #   Pass --crf 14 or --crf 12 for perceptually lossless archival masters.
-    #   -preset slower prioritizes data retention over encode speed.
+    #   -crf defaults to 12 for all SD source types — maximum quality input
+    #   for Real-ESRGAN regardless of source noise floor.
+    #   -preset fast: this is a temporary intermediate consumed frame-by-frame
+    #   by Real-ESRGAN, which does not benefit from inter-frame compression
+    #   efficiency. fast encodes significantly quicker than slower/medium with
+    #   no perceptible quality difference for an intermediate at any CRF.
     #
     #   -movflags +faststart is MP4-specific but harmless on MKV (ignored silently).
     ffmpeg -y $FFLAGS $LIMIT_CMD -i "$SOURCE_INPUT" \
         -vf "$FILTER_CHAIN" \
-        -c:v libx264 -threads 0 -crf "$CRF_VALUE" -preset slower \
+        -c:v libx264 -threads 0 -crf "$CRF_VALUE" -preset fast \
         -movflags +faststart \
         $AUDIO_CMD \
         "$PROG_OUTPUT"

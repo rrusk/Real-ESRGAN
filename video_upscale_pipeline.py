@@ -909,6 +909,8 @@ def main(args):
     print(f"  Duration:      {duration:.1f}s  →  {total_chunks} chunks × {CHUNK_DURATION_SECONDS}s")
     print(f"  Scale:         {SCALE_FACTOR}x  ({REALSRGAN_MODEL})")
     print(f"  Profile:       {profile}  →  {prefilter_vf}")
+    print(f"  Pre-filter:    CRF 12  |  preset fast  (intermediate, deleted after processing)")
+    print(f"  RIFE encode:   CRF 14  |  preset fast  (intermediate, deleted after concat)")
     print(f"  RIFE:          {'enabled (--rife): frames will be doubled' if not args.no_rife else 'disabled (default)'}")
     print(f"  Output FPS:    {output_fps_float:.3f}")
     print(f"  Output file:   {FINAL_VIDEO_FILE}")

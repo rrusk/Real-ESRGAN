@@ -16,6 +16,24 @@
 #
 #             See inline comments at each ffmpeg call for exact locations.
 # ==============================================================================
+# CHANGE HISTORY — CHROMA SUBSAMPLING
+# ==============================================================================
+# 2026-05-05: Pre-filter intermediate now encoded as yuv444p instead of yuv420p.
+#
+#             prepare_video.sh now produces yuv444p masters (also changed
+#             2026-05-05). Re-encoding to yuv420p in cmd_prefilter would apply
+#             a second lossy chroma subsampling step before ESRGAN sees the
+#             frames. yuv444p preserves the best available chroma through the
+#             full pre-filter → ESRGAN path. Real-ESRGAN decodes to float32 RGB
+#             internally regardless of pix_fmt — no inference overhead.
+#
+#             The RIFE reassembly intermediate (cmd_encode) is unchanged at
+#             yuv420p: it is assembled from PNG frames (full RGB) and the final
+#             concat is a stream copy, so the final output pix_fmt matches
+#             whatever the RIFE intermediate uses. Changing that intermediate
+#             would require a deliberate decision to change the final output
+#             format, which is out of scope here.
+# ==============================================================================
 import subprocess
 import os
 import shutil
@@ -909,7 +927,7 @@ def main(args):
     print(f"  Duration:      {duration:.1f}s  →  {total_chunks} chunks × {CHUNK_DURATION_SECONDS}s")
     print(f"  Scale:         {SCALE_FACTOR}x  ({REALSRGAN_MODEL})")
     print(f"  Profile:       {profile}  →  {prefilter_vf}")
-    print(f"  Pre-filter:    CRF 12  |  preset fast  (intermediate, deleted after processing)")
+    print(f"  Pre-filter:    CRF 12  |  preset fast  |  yuv444p  (intermediate, deleted after processing)")
     print(f"  RIFE encode:   CRF 14  |  preset fast  (intermediate, deleted after concat)")
     print(f"  RIFE:          {'enabled (--rife): frames will be doubled' if not args.no_rife else 'disabled (default)'}")
     print(f"  Output FPS:    {output_fps_float:.3f}")
@@ -1216,7 +1234,12 @@ def main(args):
                 # 2026-05-04: raised from CRF 16 to CRF 12 — all previously processed
                 # videos used CRF 16 for the pre-filter intermediate.
                 "-preset", "fast", # temporary intermediate decoded frame-by-frame: preset does not affect quality
-                "-pix_fmt", "yuv420p",
+                "-pix_fmt", "yuv444p",
+                # 2026-05-05: yuv420p -> yuv444p. The master from prepare_video.sh is
+                # already yuv444p; re-encoding to yuv420p here would apply a second lossy
+                # chroma subsampling step before ESRGAN sees the frames. yuv444p avoids
+                # that round-trip. libx264 requires pix_fmt to be stated explicitly —
+                # it does not infer it from the input stream.
                 prefiltered_chunk
             ]
             try:

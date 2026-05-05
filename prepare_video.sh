@@ -20,6 +20,18 @@
 #             Detail lost at this stage cannot be recovered by upscaling.
 #             See inline comments at each source type block for exact locations.
 # ==============================================================================
+# CHANGE HISTORY — CHROMA SUBSAMPLING
+# ==============================================================================
+# 2026-05-05: Deinterlaced master now encoded as yuv444p instead of yuv420p.
+#
+#             Native DV (NTSC) is 4:1:1. libavcodec's DV decoder outputs
+#             yuv420p, halving chroma vertically on decode. Previously, encoding
+#             the master as yuv420p applied a second lossy chroma subsampling
+#             step after bwdif had already processed those decoded frames.
+#             Encoding as yuv444p avoids that second round-trip. Real-ESRGAN
+#             decodes to float32 RGB internally regardless of pix_fmt, so there
+#             is no inference overhead — only a small increase in master file size.
+# ==============================================================================
 set -euo pipefail
 
 main() {
@@ -72,7 +84,8 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "  1. Play your video in VLC and look at the bottom edge."
     echo "  2. If you see a flickering/static line (head-switching noise), estimate its height."
     echo "  3. Typical values for Hi8/VHS are 8, 10, or 12 pixels."
-    echo "  4. CRITICAL: Always use an EVEN number to maintain YUV420p color alignment."
+    echo "  4. CRITICAL: Always use an EVEN number to maintain correct vertical alignment"
+  echo "               for the drawbox mask (applies regardless of chroma subsampling)."
     exit 0
 fi
 
@@ -173,10 +186,11 @@ BASE_NAME=$(basename "$SOURCE_INPUT")
 FILE_STEM="${BASE_NAME%.*}"
 
 # Odd Number Sanity Check
-# Prevents chroma artifacts caused by splitting 2x2 color blocks in YUV420p.
+# Prevents alignment artifacts at the drawbox mask boundary. Even numbers
+# are required for correct macroblock alignment regardless of chroma subsampling.
 if (( MASK_PIXELS % 2 != 0 )); then
     echo -e "\n⚠️  WARNING: Mask ($MASK_PIXELS) is an odd number."
-    echo "    This can cause green/purple lines due to YUV420p chroma alignment."
+    echo "    This can cause alignment artifacts at the mask boundary."
     echo "    Recommend using $((MASK_PIXELS + 1)) instead."
 fi
 
@@ -374,12 +388,23 @@ fi
 if [ "$IS_INTERLACED" = true ]; then
     echo -e "\n--- Step 2: High-Quality Deinterlacing (${FIELD_ORDER}) ---"
 
-    # Filter Chain: bwdif mode=$BWDIF_MODE, yuv420p format, and optional drawbox.
+    # Filter Chain: bwdif mode=$BWDIF_MODE, yuv444p format, and optional drawbox.
     #   mode=1 (default): field-rate output — one progressive frame per field (~60fps).
     #                     Preserves full temporal resolution; pair with --no-rife in the
     #                     upscale pipeline to avoid accidental 120fps output.
     #   mode=0 (--mode0): frame-rate output — one progressive frame per interlaced frame (~30fps).
-    FILTER_CHAIN="bwdif=mode=${BWDIF_MODE}:parity=${PARITY}:deint=0,format=yuv420p"
+    #
+    #   format=yuv444p: avoids a second lossy chroma subsampling round-trip after bwdif
+    #   shifts chroma values. The native DV bitstream is already 4:1:1 (NTSC); libavcodec
+    #   converts that to 4:2:0 during decode. Upsampling to yuv444p here preserves the best
+    #   available chroma through the full pipeline rather than halving it again at encode time.
+    #   Real-ESRGAN decodes intermediates to float32 RGB regardless of pix_fmt, so feeding
+    #   it a yuv444p master costs only slightly more disk space with no processing overhead.
+    #
+    # 2026-05-05: format=yuv420p -> format=yuv444p. Native DV is 4:1:1 (NTSC); libavcodec
+    #             decodes to 4:2:0. Encoding as yuv444p avoids a second lossy chroma
+    #             subsampling step after bwdif processes the decoded frames.
+    FILTER_CHAIN="bwdif=mode=${BWDIF_MODE}:parity=${PARITY}:deint=0,format=yuv444p"
     if [ "$MASK_PIXELS" -gt 0 ]; then
         echo "Applying mask: Bottom $MASK_PIXELS pixels"
         FILTER_CHAIN="${FILTER_CHAIN},drawbox=y=ih-${MASK_PIXELS}:h=${MASK_PIXELS}:color=black:t=fill"
@@ -404,10 +429,15 @@ if [ "$IS_INTERLACED" = true ]; then
     #   efficiency. fast encodes significantly quicker than slower/medium with
     #   no perceptible quality difference for an intermediate at any CRF.
     #
+    #   -pix_fmt yuv444p: must be stated explicitly; libx264 does not infer
+    #   pix_fmt from the filter chain. Ensures the encoded master matches the
+    #   yuv444p frames produced by the filter chain above.
+    #
     #   -movflags +faststart is MP4-specific but harmless on MKV (ignored silently).
     ffmpeg -y $FFLAGS $LIMIT_CMD -i "$SOURCE_INPUT" \
         -vf "$FILTER_CHAIN" \
         -c:v libx264 -threads 0 -crf "$CRF_VALUE" -preset fast \
+        -pix_fmt yuv444p \
         -movflags +faststart \
         $AUDIO_CMD \
         "$PROG_OUTPUT"

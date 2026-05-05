@@ -33,6 +33,10 @@
 #          on first run. mkdir -p no longer treated as fatal if dir exists.
 #   v36 -- DV mode: added --size 0 to prevent 1GB mid-segment splits.
 #   v35 -- All modes: --format dv1 (dv2 causes audio sync drift).
+#
+#   v36 -- Changed --format dv1 to --format raw: raw .dv files seek
+#          cleanly in VLC and can be trimmed with dd without AVI
+#          container overhead or index rebuilding issues.
 #   v34 -- Audit loops all AVI files; per-file [OK]/[!!!] flags; totals.
 #   v32 -- Fixed progress stopping after first DV segment (awk subline split).
 #          Improved usage/help with concrete filename examples.
@@ -95,7 +99,7 @@ usage() {
     echo "                       Warns if valid timecodes are found (suggests -t dv)."
     echo "                 dv:   Files split by recording segment, named using the"
     echo "                       filming date embedded in the DV stream."
-    echo "                       e.g. dv_1997.08.03_14.23.11.avi"
+    echo "                       e.g. dv_1997.08.03_14.23.11.dv"
     echo "  TAPE_ID        Required. A short unique identifier for the tape."
     echo "                 Spaces are allowed and will be converted to underscores."
     echo "  DESCRIPTION    Optional. Additional context appended to the filename."
@@ -109,38 +113,38 @@ usage() {
     echo ""
     echo "  Hi8 mode (default, -t hi8):"
     echo "    One large file per capture. The file is named after the session:"
-    echo "      <TAPE_ID>[_<DESCRIPTION>]_<YYYYMMDD_HHMM>001.avi"
+    echo "      <TAPE_ID>[_<DESCRIPTION>]_<YYYYMMDD_HHMM>001.dv"
     echo "    If the signal drops and dvgrab autosplits, a second file appears:"
-    echo "      <TAPE_ID>[_<DESCRIPTION>]_<YYYYMMDD_HHMM>002.avi"
+    echo "      <TAPE_ID>[_<DESCRIPTION>]_<YYYYMMDD_HHMM>002.dv"
     echo "    Hi8 has no internal clock so filenames use the CAPTURE date."
     echo ""
     echo "    Example: $0 hi8_20040107-20040207 'Christmas 2004'"
     echo "      Directory: ${CAPTURE_ROOT}/hi8_20040107-20040207_Christmas_2004_20260406_1347/"
-    echo "      File(s):   hi8_20040107-20040207_Christmas_2004_20260406_1347001.avi"
-    echo "                 hi8_20040107-20040207_Christmas_2004_20260406_1347002.avi  (if autosplit)"
+    echo "      File(s):   hi8_20040107-20040207_Christmas_2004_20260406_1347001.dv"
+    echo "                 hi8_20040107-20040207_Christmas_2004_20260406_1347002.dv  (if autosplit)"
     echo ""
     echo "    Example: $0 hi8_20040107-20040207"
     echo "      Directory: ${CAPTURE_ROOT}/hi8_20040107-20040207_20260406_1347/"
-    echo "      File(s):   hi8_20040107-20040207_20260406_1347001.avi"
+    echo "      File(s):   hi8_20040107-20040207_20260406_1347001.dv"
     echo ""
     echo "  Digital8 mode (-t dv):"
     echo "    One file per recording segment, named using the FILMING date embedded"
     echo "    in the DV stream so files sort chronologically by content."
     echo "    Files inside the session directory are named by dvgrab as:"
-    echo "      <TAPE_ID>_<YYYY.MM.DD_HH-MM-SS>.avi"
+    echo "      <TAPE_ID>_<YYYY.MM.DD_HH-MM-SS>.dv"
     echo "    If the same filming date appears in multiple segments, dvgrab appends"
-    echo "    a counter: <TAPE_ID>_<date>-1.avi, <TAPE_ID>_<date>-2.avi, etc."
+    echo "    a counter: <TAPE_ID>_<date>-1.dv, <TAPE_ID>_<date>-2.dv, etc."
     echo ""
     echo "    Example: $0 -t dv dv_20040107-20040207"
     echo "      Directory: ${CAPTURE_ROOT}/dv_20040107-20040207_20260406_1347/"
-    echo "      File(s):   dv_20040107-20040207_2004.01.07_14-23-11.avi"
-    echo "                 dv_20040107-20040207_2004.01.15_09-05-44.avi"
-    echo "                 dv_20040107-20040207_2004.02.07_18-30-00.avi"
+    echo "      File(s):   dv_20040107-20040207_2004.01.07_14-23-11.dv"
+    echo "                 dv_20040107-20040207_2004.01.15_09-05-44.dv"
+    echo "                 dv_20040107-20040207_2004.02.07_18-30-00.dv"
     echo ""
     echo "    Example: $0 -t dv dv"
     echo "      Directory: ${CAPTURE_ROOT}/dv_20260406_1802/"
-    echo "      File(s):   dv_2004.05.02_16-52-12.avi"
-    echo "                 dv_2004.05.15_11-04-33.avi"
+    echo "      File(s):   dv_2004.05.02_16-52-12.dv"
+    echo "                 dv_2004.05.15_11-04-33.dv"
     echo ""
     echo "NOTES"
     echo "-----"
@@ -326,9 +330,8 @@ if [[ "$TAPE_TYPE" == "dv" ]]; then
     # 1GB size limit, which would otherwise split files mid-segment regardless
     # of timecode boundaries.
     FLAGS=(
-        --format dv1     # Type 1 AVI -- single integrated DV track avoids
-                         # the audio sync drift seen with dv2's separate track.
-                         # Use dv2 only if downstream tool compatibility requires it.
+        --format raw     # Raw DV stream -- seeks cleanly in VLC, trims
+                         # instantly with dd, no AVI container overhead.
         --size 0         # Disable 1GB size-based splitting; let --autosplit
                          # handle splits on timecode discontinuities only
         --timestamp      # Name files using embedded DV recording date
@@ -341,8 +344,8 @@ else
     # Hi8 analog: no valid internal timecodes, so use a single large file
     # named with the capture session date.
     FLAGS=(
-        --format dv1     # Type 1 AVI -- single integrated DV track avoids
-                         # the audio sync drift seen with dv2's separate track
+        --format raw     # Raw DV stream -- seeks cleanly in VLC, trims
+                         # instantly with dd, no AVI container overhead
         --size 0         # Single large file; no size-based splitting
         --autosplit      # Split ONLY on signal loss or timecode jumps
         --opendml        # Support files >4GB (essential for 120min tapes)
@@ -371,7 +374,7 @@ PROGRESS_FRAMES=$(( PROGRESS_INTERVAL_SEC * 2997 / 100 ))
 
 # Output file prefix passed to dvgrab and awk.
 # For Digital8: use only SAFE_ID so dvgrab appends the filming date directly,
-# giving files like "dv_1997.08.03_14.23.11.avi" that sort by content date.
+# giving files like "dv_1997.08.03_14.23.11.dv" that sort by content date.
 # The capture session date is preserved in OUTPUT_DIR for provenance.
 # For Hi8: use the full BASE_NAME including session date.
 if [[ "$TAPE_TYPE" == "dv" ]]; then
@@ -397,7 +400,7 @@ STALL_TIMEOUT_SEC=120
 #   \r-delimited status stream. This creates a single \r-record that
 #   contains TWO logical lines joined by \n:
 #
-#     "/path/to/new_segment.avi":\n   123 frames timecode ... date ...
+#     "/path/to/new_segment.dv":\n   123 frames timecode ... date ...
 #
 #   In v18, the record-level gsub and regex were applied to the whole
 #   combined blob. The frame-count regex could fail to match, causing
@@ -515,7 +518,7 @@ stdbuf -oL dvgrab "${FLAGS[@]}" "$OUTPUT_FILE_PREFIX" 2>&1 \
             # on the very first frame of a new segment) correctly announces the
             # new file AND is then also processed for progress below.
             # ------------------------------------------------------------------
-            if (tape_type == "dv" && line ~ /\.avi":/) {
+            if (tape_type == "dv" && line ~ /\.dv":/) {
                 fname = line
                 gsub(/.*\//, "", fname)
                 gsub(/".*/, "", fname)
@@ -676,14 +679,14 @@ printf '\a'
 echo "---------------------------------------------------------"
 echo "RUNNING DATA INTEGRITY AUDIT..."
 
-# nullglob prevents the glob literal being passed as a filename if no .avi
+# nullglob prevents the glob literal being passed as a filename if no .dv
 # files exist. The array then reliably holds zero or more actual paths.
 shopt -s nullglob
-AVI_FILES=("$OUTPUT_DIR"/*.avi)
+DV_FILES=("$OUTPUT_DIR"/*.dv)
 shopt -u nullglob
 
-if [ "${#AVI_FILES[@]}" -eq 0 ]; then
-    echo "[ERROR] No AVI file was generated. Check $LOG_FILE" | tee -a "$LOG_FILE"
+if [ "${#DV_FILES[@]}" -eq 0 ]; then
+    echo "[ERROR] No DV file was generated. Check $LOG_FILE" | tee -a "$LOG_FILE"
     exit 1
 fi
 
@@ -696,14 +699,14 @@ FFPROBE_FALLBACK_NOTED=0
 {
     echo "DATA INTEGRITY AUDIT: $BASE_NAME"
     echo "Generated: $(date)"
-    echo "Files: ${#AVI_FILES[@]}"
+    echo "Files: ${#DV_FILES[@]}"
     echo "---------------------------------------------------------"
 
     # Sort files lexicographically -- DV segment filenames embed the filming
-    # date (dv_YYYY.MM.DD_HH-MM-SS.avi) so lex order == chronological order.
+    # date (dv_YYYY.MM.DD_HH-MM-SS.dv) so lex order == chronological order.
     # Hi8 files use a session-date prefix and a numeric suffix (001, 002...)
     # which also sorts correctly lexicographically.
-    for AVI_FILE in $(printf '%s\n' "${AVI_FILES[@]}" | sort); do
+    for AVI_FILE in $(printf '%s\n' "${DV_FILES[@]}" | sort); do
 
         # Extract only duration= and bit_rate= lines, discarding dvvideo
         # decoder warnings (AC EOB marker, Concealing bitstream errors) that
@@ -731,7 +734,7 @@ FFPROBE_FALLBACK_NOTED=0
                 BITRATE=$(echo "scale=0; ($FILE_SIZE * 8) / $DURATION" | bc)
                 BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
                 if [[ "$FFPROBE_FALLBACK_NOTED" -eq 0 ]]; then
-                    echo "[INFO] Bitrate calculated from file size (ffprobe returned N/A -- normal for DV/AVI)."
+                    echo "[INFO] Bitrate calculated from file size (ffprobe returned N/A -- normal for DV)."
                     FFPROBE_FALLBACK_NOTED=1
                 fi
             fi
@@ -786,7 +789,7 @@ FFPROBE_FALLBACK_NOTED=0
     echo "Total duration: ${TOTAL_HMS}  |  Total size: ${TOTAL_GiB} GiB  |  Overall bitrate: ${OVERALL_MBPS} Mbps"
     echo ""
     if [[ "$WARN_COUNT" -eq 0 ]]; then
-        echo "[SUCCESS] All ${#AVI_FILES[@]} file(s) passed integrity check."
+        echo "[SUCCESS] All ${#DV_FILES[@]} file(s) passed integrity check."
     else
         echo "[!!!] WARNING: ${WARN_COUNT} file(s) flagged above. Check $LOG_FILE for dropped frames."
     fi
@@ -797,8 +800,8 @@ FFPROBE_FALLBACK_NOTED=0
 # ==============================================================================
 # 9. Recording Date Analysis
 # ==============================================================================
-# For Digital8: filming dates are embedded in the AVI filenames by dvgrab
-# (e.g. test_2012.12.25_06-58-41.avi) so we extract them directly from the
+# For Digital8: filming dates are embedded in the DV filenames by dvgrab
+# (e.g. test_2012.12.25_06-58-41.dv) so we extract them directly from the
 # filenames -- no log parsing needed and no awk-emitted date lines required.
 #
 # For Hi8: filenames use the capture session date, not the filming date, so
@@ -809,10 +812,10 @@ echo "---------------------------------------------------------"
 echo "ANALYSING RECORDING DATES..."
 
 if [[ "$TAPE_TYPE" == "dv" ]]; then
-    # Extract YYYY.MM.DD from AVI filenames. DV filenames use the filming
+    # Extract YYYY.MM.DD from DV filenames. DV filenames use the filming
     # date from the DV stream directly so no year filtering is needed --
     # the dates are trustworthy unlike Hi8 timecodes.
-    VALID_DATES=$(printf '%s\n' "${AVI_FILES[@]}" \
+    VALID_DATES=$(printf '%s\n' "${DV_FILES[@]}" \
         | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}' \
         | sort -u)
 

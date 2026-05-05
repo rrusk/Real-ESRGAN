@@ -565,6 +565,25 @@ fi
 # ==============================================================================
 # PHASE 1 — Audio peak detection
 # ==============================================================================
+# cleanup() is defined here (before first use) so the EXIT trap covers all
+# phases.  Phase-3 variables are guarded with :- so early exits are safe.
+cleanup() {
+    # Remove any alignment.json left in ~/Downloads by the browser.  If the
+    # script exits before check_alignment_json() moves it to the session dir,
+    # this prevents it from silently interfering with a later run.
+    rm -f "${HOME}/Downloads/alignment.json"
+    # Phase-3 temporaries (may be unset if we exit before Phase 3).
+    [[ -n "${LUA_SCRIPT:-}"       ]] && rm -f "$LUA_SCRIPT"
+    [[ -n "${LEFT_LABEL_FILE:-}"  ]] && rm -f "$LEFT_LABEL_FILE"
+    [[ -n "${RIGHT_LABEL_FILE:-}" ]] && rm -f "$RIGHT_LABEL_FILE"
+    [[ -n "${LEFT_SOCKET:-}"      ]] && rm -f "$LEFT_SOCKET"  2>/dev/null || true
+    [[ -n "${RIGHT_SOCKET:-}"     ]] && rm -f "$RIGHT_SOCKET" 2>/dev/null || true
+    [[ -n "${LEFT_PID:-}"         ]] && kill "$LEFT_PID"  2>/dev/null || true
+    [[ -n "${RIGHT_PID:-}"        ]] && kill "$RIGHT_PID" 2>/dev/null || true
+    stty sane 2>/dev/null || true  # restore terminal if mpv left it in raw mode
+}
+trap cleanup EXIT
+
 if [[ "$SKIP_TO_PLAYBACK" == false ]]; then
 
 echo ""
@@ -579,11 +598,14 @@ MANUAL_OFFSET=""
 while [[ "$PHASE1_DONE" == false ]]; do
 
     if [[ -n "$MANUAL_OFFSET" ]]; then
-        # User entered offset manually — skip peak detection
+        # User entered offset manually — accept immediately, no re-confirmation needed
         RAW_OFFSET="$MANUAL_OFFSET"
         PEAK_LEFT="manual"
         PEAK_RIGHT="manual"
+        COARSE_OFFSET="$RAW_OFFSET"
+        DEFAULT_ALIGN_TIME="30"  # fallback alignment point when no audio peak available
         echo "  Using manual offset: ${RAW_OFFSET}s"
+        break
     else
         echo "  Analysing left file  : $LEFT_FILE"
         PEAK_LEFT=$(find_peak "$LEFT_FILE")
@@ -646,7 +668,11 @@ while [[ "$PHASE1_DONE" == false ]]; do
     echo "  └─────────────────────────────────────────┘"
     echo ""
     echo "  Does this look reasonable?"
-    echo "    y — yes, proceed to frame alignment"
+    if python3 -c "import sys; sys.exit(0 if float('${RAW_OFFSET}') == 0 else 1)" 2>/dev/null; then
+        echo "    y — yes, files are in sync (will offer to skip blink comparator)"
+    else
+        echo "    y — yes, proceed to frame alignment"
+    fi
     echo "    m — enter offset manually instead"
     echo "    v — launch rough VLC side-by-side to estimate visually"
     echo "    q — quit"
@@ -657,12 +683,7 @@ while [[ "$PHASE1_DONE" == false ]]; do
         y|Y)
             PHASE1_DONE=true
             COARSE_OFFSET="$RAW_OFFSET"
-            # Audio peak position in left file is the default alignment point
-            if [[ "$PEAK_LEFT" == "manual" ]]; then
-                DEFAULT_ALIGN_TIME="30"  # fallback when manually entered
-            else
-                DEFAULT_ALIGN_TIME="$PEAK_LEFT"
-            fi
+            DEFAULT_ALIGN_TIME="$PEAK_LEFT"  # audio peak position in left file
             ;;
         m|M)
             printf "  Enter offset (positive = left leads right, in seconds): "
@@ -683,9 +704,43 @@ while [[ "$PHASE1_DONE" == false ]]; do
 
 done  # while PHASE1_DONE == false
 
+# When the confirmed offset is exactly zero the files are already in sync and
+# there is nothing for the blink comparator to tune.  Offer to write
+# alignment.json directly and jump to Phase 3, mirroring --aligned behaviour.
+if python3 -c "import sys; sys.exit(0 if float('${COARSE_OFFSET}') == 0 else 1)" 2>/dev/null; then
+    echo ""
+    echo "  Offset is 0 — files are already in sync."
+    echo "  Skip the blink comparator and go straight to playback?"
+    echo "    y — yes, write alignment.json and proceed to Phase 3"
+    echo "    n — no, run the blink comparator anyway (Phase 2)"
+    printf "  Choice [Y/n]: "
+    read -r skip_phase2 </dev/tty
+    if [[ ! "$skip_phase2" =~ ^[Nn]$ ]]; then
+        echo ""
+        echo "[Aligned] Writing zero-offset alignment.json..."
+        python3 -c "
+import json
+d = {
+    'offset':      0,
+    'left_label':  '$LEFT_LABEL',
+    'right_label': '$RIGHT_LABEL',
+    'aligned_at':  '00:00:00.000',
+    'note':        'offset confirmed as 0 in Phase 1; blink comparator skipped'
+}
+json.dump(d, open('$ALIGNMENT_JSON', 'w'), indent=2)
+print('  Written:', '$ALIGNMENT_JSON')
+"
+        CONFIRMED_OFFSET="0"
+        CONFIRMED_LEFT_LABEL="$LEFT_LABEL"
+        CONFIRMED_RIGHT_LABEL="$RIGHT_LABEL"
+        SKIP_TO_PLAYBACK=true
+    fi
+fi
+
 # ==============================================================================
 # PHASE 2 — Frame-accurate alignment via blink comparator
 # ==============================================================================
+if [[ "$SKIP_TO_PLAYBACK" == false ]]; then
 echo ""
 echo "============================================="
 echo "  Phase 2: Frame-accurate alignment"
@@ -694,7 +749,11 @@ echo "============================================="
 ALIGN_TC=$(format_tc "$DEFAULT_ALIGN_TIME")
 echo ""
 echo "  Default alignment position: ${DEFAULT_ALIGN_TIME}s (${ALIGN_TC})"
-echo "  This is the audio peak position in the left file."
+if [[ "$PEAK_LEFT" == "manual" ]]; then
+    echo "  (Offset was entered manually; using ${DEFAULT_ALIGN_TIME}s as a default.)"
+else
+    echo "  This is the audio peak position in the left file."
+fi
 echo ""
 echo "  Use this position? A visually distinctive moment (sharp edges,"
 echo "  motion, text) gives a cleaner diff than a static wide shot."
@@ -913,7 +972,9 @@ case "$choice" in
         ;;
 esac
 
-fi  # SKIP_TO_PLAYBACK == false
+fi  # SKIP_TO_PLAYBACK == false (Phase 2)
+
+fi  # SKIP_TO_PLAYBACK == false (outer: Phases 1+2)
 
 # ==============================================================================
 # PHASE 3 — Synchronized side-by-side playback
@@ -973,7 +1034,8 @@ fi
 if [[ ( -n "$RESUME_DIR" || "$RESUMED_FROM_JSON" == true ) \
       && -n "$BLINK_SCRIPT" && -x "$BLINK_SCRIPT" \
       && "$REALIGN_THRESHOLD" -gt 0 && "$START_TIME" != "0" \
-      && -z "$ALIGNED" ]]; then
+      && -z "$ALIGNED" \
+      && "${CONFIRMED_OFFSET:-1}" != "0" ]]; then
     ALIGNED_AT_SECS=$(python3 -c "
 import json
 d = json.load(open('$ALIGNMENT_JSON'))
@@ -1477,15 +1539,28 @@ mp.register_event("file-loaded", function()
         or ""
     mp.osd_message(my_label() .. " — paired with " .. peer_label() .. wp_hint, 3)
 
-    -- Position tracking: left instance writes resume.json every 60 seconds.
+    -- Position tracking: left instance writes resume.json every 60 seconds
+    -- and again on quit, so short sessions are never lost.
     -- Position is stored in left-file time (lagging source starts at 0,
     -- leading source is offset-adjusted at launch, so left-file time is the
     -- natural seek reference for --start on next resume).
     if side == "left" then
         local resume_file = os.getenv("DUAL_RESUME_FILE") or ""
         if resume_file ~= "" then
-            mp.add_periodic_timer(60, function()
-                local pos = mp.get_property_number("time-pos")
+            -- last_pos_secs: continuously updated from the time-pos observer so
+            -- it is available even after mpv has unloaded the file (at which
+            -- point mp.get_property_number("time-pos") returns nil).
+            local last_pos_secs = nil
+
+            mp.observe_property("time-pos", "number", function(_, pos)
+                if pos and pos > 0 then last_pos_secs = pos end
+            end)
+
+            -- write_resume: write resume.json from last_pos_secs.
+            -- rollback_secs: subtract this many seconds so the next session
+            -- gets a run-up to re-establish alignment (0 = save exact position).
+            local function write_resume(rollback_secs)
+                local pos = last_pos_secs
                 if pos and pos > 0 then
                     -- Convert left-file position to lagging-source time.
                     local lag_pos
@@ -1494,10 +1569,7 @@ mp.register_event("file-loaded", function()
                     else
                         lag_pos = pos
                     end
-                    -- Save 60 seconds behind current position so resume
-                    -- gives a run-up to re-establish alignment before
-                    -- reaching the point where playback stopped.
-                    lag_pos = math.max(0, lag_pos - 60)
+                    lag_pos = math.max(0, lag_pos - (rollback_secs or 0))
                     local h = math.floor(lag_pos / 3600)
                     local m = math.floor((lag_pos % 3600) / 60)
                     local s = lag_pos % 60
@@ -1510,7 +1582,13 @@ mp.register_event("file-loaded", function()
                         f:close()
                     end
                 end
-            end)
+            end
+            -- Periodic save: 60s rollback gives a run-up on next resume.
+            mp.add_periodic_timer(60, function() write_resume(60) end)
+            -- On quit: save exact position — no rollback needed since we know
+            -- precisely where playback stopped.  Uses last_pos_secs rather than
+            -- querying time-pos, which is nil once mpv has unloaded the file.
+            mp.register_event("shutdown", function() write_resume(0) end)
         end
     end
 end)
@@ -1520,15 +1598,6 @@ LUAEOF
 # Clean up temp files on exit
 LEFT_PID=""
 RIGHT_PID=""
-
-cleanup() {
-    rm -f "$LUA_SCRIPT" "$LEFT_LABEL_FILE" "$RIGHT_LABEL_FILE"
-    rm -f "$LEFT_SOCKET" "$RIGHT_SOCKET" 2>/dev/null || true
-    [[ -n "$LEFT_PID"  ]] && kill "$LEFT_PID"  2>/dev/null || true
-    [[ -n "$RIGHT_PID" ]] && kill "$RIGHT_PID" 2>/dev/null || true
-    stty sane 2>/dev/null || true  # restore terminal if mpv left it in raw mode
-}
-trap cleanup EXIT
 
 echo "  Launching synchronized players..."
 echo "  (socat is used for IPC — install with: sudo apt install socat)"

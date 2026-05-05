@@ -1,7 +1,19 @@
 #!/bin/bash
 # ==============================================================================
-# Script Name: cleanup_video.sh
-# Description: All-in-one analog video cleanup for VHS, Hi8, and DV sources.
+# Script Name: enhance_video.sh
+# Description: All-in-one deterministic video enhancement for VHS, Hi8, and
+#              DV sources. Handles raw captures directly — no prior preparation
+#              step needed.
+#
+#              Combines the source-handling logic of prepare_video.sh
+#              (deinterlacing, field order detection, DV codec quirks, broken
+#              timestamp repair, bottom mask) with enhancement profiles tuned
+#              for a final kept output rather than AI upscaler input.
+#
+#              Provides a fully deterministic alternative to the
+#              prepare_video.sh -> video_upscale_pipeline.py AI workflow:
+#              deinterlace, denoise, deblock, and Lanczos upscale in a single
+#              pass with no neural network involvement.
 #              Handles raw captures directly — no prior preparation step needed.
 #
 #              Combines the source-handling logic of prepare_video.sh
@@ -49,13 +61,6 @@ set -euo pipefail
 
 main() {
 
-# --- 0. Virtual Environment Guard ---
-if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-    echo -e "\n[!] WARNING: Virtual environment not detected."
-    echo "    Recommended: source venv/bin/activate"
-    echo "    Continuing without venv — tool versions are not guaranteed."
-fi
-
 # --- 1. Argument Check ---
 if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "Usage: $0 <source_video> [mask_pixels] [options]"
@@ -74,11 +79,13 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "                       Common values: 1 (native), 2 (default), 4 (4K displays)."
     echo "                       No AI — purely geometric. DAR is auto-detected and"
     echo "                       preserved regardless of scale factor."
-    echo "  --sharpen            Apply a mild unsharp pass (unsharp=3:3:0.3) after all"
-    echo "                       other filters. Not needed with the default 2x upscale —"
-    echo "                       lanczos already compensates for hqdn3d softening."
-    echo "                       Useful with --scale 1 when edge recovery is desired"
-    echo "                       without upscaling."
+    echo "  --sharpen            Apply an additional unsharp pass (unsharp=3:3:0.3) after"
+    echo "                       all other filters. Most profiles already include a"
+    echo "                       conservative unsharp=3:3:0.15 pass; --sharpen adds a"
+    echo "                       second pass on top, bringing effective strength to ~0.45."
+    echo "                       Use only if the profile's built-in sharpening is"
+    echo "                       insufficient. Exception: the halo profile has no built-in"
+    echo "                       unsharp — --sharpen adds the only pass, so use with care."
     echo "  --dar W:H            Override the auto-detected display aspect ratio."
     echo "                       DAR is normally inferred automatically from resolution"
     echo "                       and SAR metadata (e.g. 720x480 NTSC -> 4:3 or 16:9)."
@@ -96,9 +103,12 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "                       full-resolution progressive frame (~30fps). Lower"
     echo "                       CPU cost and smaller output file."
     echo ""
-    echo "  --crf N              x264 quality level (default: 18)."
+    echo "  --crf N              x264 quality level (default: 16 — near-transparent for SD)."
     echo "                       Lower = higher quality and larger file."
-    echo "                       16 is near-transparent; 20 suits casual archival."
+    echo "                       14   perceptually lossless for most SD sources."
+    echo "                       16   default; suitable for archival watchable copies."
+    echo "                       18   acceptable for casual viewing copies."
+    echo "                       20+  visible quality loss; not recommended for archival."
     echo "  --aac                Force AAC audio output (192k). Default: lossless copy."
     echo "                       PCM sources automatically use .mkv to avoid re-encoding."
     echo "                       Use --aac only if you need an MP4 container instead."
@@ -165,10 +175,10 @@ MASK_PIXELS=0
 MASK_EXPLICITLY_SET=false
 PROFILE="balanced"
 SCALE_FACTOR=2  # default: 2x lanczos upscale; override with --scale N (use 1 to disable)
-SHARPEN=false   # opt-in; not needed with upscale — lanczos compensates for hqdn3d softening
+SHARPEN=false   # opt-in; profiles already include unsharp=3:3:0.15 (except halo)
 DAR_OVERRIDE=""
 BWDIF_MODE=1    # default: field-rate output (~60fps); --mode0 sets this to 0 (~30fps)
-CRF_VALUE=18
+CRF_VALUE=16    # default: near-transparent for SD; lower (e.g. 14) for maximum archival quality
 FORCE_AAC=false
 TEST_MODE=false
 FORCE_60FPS=false
@@ -223,7 +233,27 @@ for arg in "$@"; do
     fi
 done
 
-# --- 3. Validate Profile ---
+# --- 3. Validate CRF ---
+# Catches non-integer values (e.g. '--crf fast') before ffmpeg sees them,
+# and warns when the value seems unreasonable for a kept archival output.
+# Hard error above 51 (x264 maximum). Warnings are informational only.
+if ! [[ "$CRF_VALUE" =~ ^[0-9]+$ ]]; then
+    echo "Error: --crf requires a whole number (got: '$CRF_VALUE')." >&2
+    exit 1
+fi
+if (( CRF_VALUE > 51 )); then
+    echo "Error: CRF $CRF_VALUE is out of range — x264 maximum is 51." >&2
+    exit 1
+fi
+if (( CRF_VALUE > 20 )); then
+    echo -e "⚠️  WARNING: CRF $CRF_VALUE will produce visible quality loss on SD material."
+    echo "    For archival output, 16 (default) or 14 (maximum quality) are recommended."
+elif (( CRF_VALUE < 12 )); then
+    echo -e "⚠️  WARNING: CRF $CRF_VALUE is very low — files will be very large with"
+    echo "    negligible quality benefit over CRF 12–14 on SD source material."
+fi
+
+# --- 5. Validate Profile ---
 # Each profile has two variants: 30fps (default) and 60fps (bwdif mode=1 masters).
 #
 # Differences from video_upscale_pipeline.py profiles:
@@ -247,43 +277,49 @@ declare -A PROFILES_30FPS
 declare -A PROFILES_60FPS
 declare -A PROFILE_DESCRIPTIONS
 
-# balanced: luma_sp raised 2->3 vs pipeline; unsharp removed (lanczos handles sharpness)
-PROFILES_30FPS["balanced"]="hqdn3d=3:3:6:6,pp=fd"
-PROFILES_60FPS["balanced"]="hqdn3d=3:3:3:3,pp=fd"
+# balanced: luma_sp lowered 3->2.5 to match pipeline; unsharp=3:3:0.15 added back.
+# Lanczos handles high-frequency sharpness but unsharp recovers local contrast in
+# shadows that lanczos does not address, matching pipeline tonal depth more closely.
+PROFILES_30FPS["balanced"]="hqdn3d=2.5:3:6:6,pp=fd,unsharp=3:3:0.15"
+PROFILES_60FPS["balanced"]="hqdn3d=2.5:3:3:3,pp=fd,unsharp=3:3:0.15"
 PROFILE_DESCRIPTIONS["balanced"]="Moderate denoise, temporal stability, fast deblock. Hi8/S-Video -> DVD."
 
-# aggressive: luma_sp raised 3->4; unsharp removed
-PROFILES_30FPS["aggressive"]="hqdn3d=4:4:6:6,pp=ac"
-PROFILES_60FPS["aggressive"]="hqdn3d=4:4:3:3,pp=ac"
+# aggressive: luma_sp lowered 4->3 to match pipeline; unsharp=3:3:0.15 added back.
+PROFILES_30FPS["aggressive"]="hqdn3d=3:4:6:6,pp=ac,unsharp=3:3:0.15"
+PROFILES_60FPS["aggressive"]="hqdn3d=3:4:3:3,pp=ac,unsharp=3:3:0.15"
 PROFILE_DESCRIPTIONS["aggressive"]="Strong spatial denoise, full deblock+dering. Heavy noise or composite captures."
 
-# halo: spatial/temporal unchanged (already heavy); unsharp removed
-# Removing unsharp is especially important here — sharpening over heavy denoise
-# risks re-introducing the edge artifacts this profile exists to suppress.
+# halo: spatial/temporal unchanged from pipeline; unsharp deliberately omitted.
+# Adding unsharp after heavy denoise would reintroduce the edge artifacts this
+# profile exists to suppress. Do not add unsharp here — use --sharpen only if
+# you have verified the halo is fully gone in a --test run.
 PROFILES_30FPS["halo"]="hqdn3d=4:4:8:8,pp=fd"
 PROFILES_60FPS["halo"]="hqdn3d=4:4:4:4,pp=fd"
 PROFILE_DESCRIPTIONS["halo"]="Heavy denoise to suppress ringing/ghosting around dark edges."
 
-# dv: luma_sp raised 1.5->2.5; unsharp removed
-# DV sources are genuinely sharp — lanczos at 2x is sufficient to restore
-# perceived crispness without risking sharpening-induced ringing.
-PROFILES_30FPS["dv"]="hqdn3d=2.5:2.5:4:4,pp=ac"
-PROFILES_60FPS["dv"]="hqdn3d=2.5:2.5:2:2,pp=ac"
+# dv: luma_sp lowered 2.5->2 to match pipeline; unsharp=3:3:0.15 added back.
+# DV sources are genuinely sharp — test for ringing before using on clean footage.
+PROFILES_30FPS["dv"]="hqdn3d=2:2.5:4:4,pp=ac,unsharp=3:3:0.15"
+PROFILES_60FPS["dv"]="hqdn3d=2:2.5:2:2,pp=ac,unsharp=3:3:0.15"
 PROFILE_DESCRIPTIONS["dv"]="Light-moderate denoise, full deblock+dering. MiniDV/Digital8/DV AVI."
 
-# hi8dv: luma_sp raised 2->3; unsharp removed
-PROFILES_30FPS["hi8dv"]="hqdn3d=3:3:5:5,pp=ac"
-PROFILES_60FPS["hi8dv"]="hqdn3d=3:3:2.5:2.5,pp=ac"
+# hi8dv: luma_sp lowered 3->2 to match pipeline; unsharp=3:3:0.15 added back.
+PROFILES_30FPS["hi8dv"]="hqdn3d=2:3:5:5,pp=ac,unsharp=3:3:0.15"
+PROFILES_60FPS["hi8dv"]="hqdn3d=2:3:2.5:2.5,pp=ac,unsharp=3:3:0.15"
 PROFILE_DESCRIPTIONS["hi8dv"]="Moderate denoise targeting tape grain, full deblock. Hi8 via Digital8/FireWire DV capture."
 
-# vhsdv: luma_sp raised 2.5->3; chroma_sp raised 3->3.5; unsharp removed
-PROFILES_30FPS["vhsdv"]="hqdn3d=3:3.5:5:5,pp=ac"
-PROFILES_60FPS["vhsdv"]="hqdn3d=3:3.5:2.5:2.5,pp=ac"
+# vhsdv: luma_sp lowered 3->2.5, chroma_sp lowered 3.5->3 to match pipeline;
+# unsharp=3:3:0.15 added back for shadow tonal depth.
+PROFILES_30FPS["vhsdv"]="hqdn3d=2.5:3:5:5,pp=ac,unsharp=3:3:0.15"
+PROFILES_60FPS["vhsdv"]="hqdn3d=2.5:3:2.5:2.5,pp=ac,unsharp=3:3:0.15"
 PROFILE_DESCRIPTIONS["vhsdv"]="Stronger chroma spatial denoise for VHS color-under noise. VHS via camcorder S-Video passthrough."
 
-# vhsdv_composite: luma_sp raised 2.5->3; chroma_sp raised 3.5->4; unsharp removed
-PROFILES_30FPS["vhsdv_composite"]="hqdn3d=3:4:5:5,pp=ac"
-PROFILES_60FPS["vhsdv_composite"]="hqdn3d=3:4:2.5:2.5,pp=ac"
+# vhsdv_composite: luma_sp lowered 3->2.5, chroma_sp lowered 4->3.5 to match
+# pipeline; unsharp=3:3:0.15 added back for shadow tonal depth.
+# The 0.5 chroma_sp gap vs vhsdv is preserved — composite genuinely needs more
+# chroma smoothing than S-Video due to comb filter dot crawl and cross-colour.
+PROFILES_30FPS["vhsdv_composite"]="hqdn3d=2.5:3.5:5:5,pp=ac,unsharp=3:3:0.15"
+PROFILES_60FPS["vhsdv_composite"]="hqdn3d=2.5:3.5:2.5:2.5,pp=ac,unsharp=3:3:0.15"
 PROFILE_DESCRIPTIONS["vhsdv_composite"]="Elevated chroma spatial denoise for dot crawl/cross-colour from composite comb filter. VHS via camcorder composite passthrough."
 
 VALID_PROFILES=("balanced" "aggressive" "halo" "dv" "hi8dv" "vhsdv" "vhsdv_composite")
@@ -297,7 +333,26 @@ if [[ "$PROFILE_VALID" == false ]]; then
     exit 1
 fi
 
-# --- 4. Profile-Based Default Mask ---
+# Build a human-readable sharpening label for the pre-flight summary.
+# Both $PROFILE (validated above) and $SHARPEN (set during argument parsing)
+# are known here, well before probing or FPS detection runs.
+# halo carries no built-in unsharp; all other profiles include unsharp=3:3:0.15.
+# --sharpen appends a further unsharp=3:3:0.3 pass on top.
+if [[ "$PROFILE" == "halo" ]]; then
+    if [[ "$SHARPEN" == true ]]; then
+        SHARPEN_LABEL="unsharp=3:3:0.3 (--sharpen only; halo has no built-in unsharp)"
+    else
+        SHARPEN_LABEL="none (halo profile — unsharp deliberately omitted)"
+    fi
+else
+    if [[ "$SHARPEN" == true ]]; then
+        SHARPEN_LABEL="unsharp=3:3:0.15 (profile) + unsharp=3:3:0.3 (--sharpen)"
+    else
+        SHARPEN_LABEL="unsharp=3:3:0.15 (profile built-in)"
+    fi
+fi
+
+# --- 6. Profile-Based Default Mask ---
 # Head-switching noise at the bottom edge is an analog tape artifact present on
 # VHS, Hi8, and any other analog tape source. It is absent on native digital
 # sources (MiniDV/Digital8 footage recorded digitally) because there is no
@@ -330,7 +385,7 @@ else
     MASK_SOURCE="user specified"
 fi
 
-# --- 5. Odd Mask Warning ---
+# --- 7. Odd Mask Warning ---
 # Odd mask values split 2x2 YUV420p chroma blocks, producing green/purple fringing.
 if (( MASK_PIXELS % 2 != 0 )); then
     echo -e "\n⚠️  WARNING: Mask ($MASK_PIXELS) is an odd number."
@@ -338,7 +393,7 @@ if (( MASK_PIXELS % 2 != 0 )); then
     echo "    Recommend using $((MASK_PIXELS + 1)) instead."
 fi
 
-# --- 6. ISO Guard ---
+# --- 8. ISO Guard ---
 if [[ "${SOURCE_INPUT,,}" == *.iso ]]; then
     echo -e "\n[!] ERROR: Cannot process .ISO files directly."
     echo "    1. Mount the ISO (e.g., open it in your file manager)."
@@ -347,41 +402,7 @@ if [[ "${SOURCE_INPUT,,}" == *.iso ]]; then
     exit 1
 fi
 
-# --- 7. Early Summary: Confirm Arguments Before Probing ---
-# Show what is known from command-line arguments alone and get user confirmation
-# before running the slow probing steps (timestamp check, interlace detection,
-# and potentially idet pixel analysis). This catches configuration mistakes
-# (wrong profile, wrong mask) without waiting minutes for probing to complete.
-echo ""
-echo "========================================="
-echo "         ARGUMENT SUMMARY"
-echo "========================================="
-echo "Source file:   $SOURCE_INPUT"
-echo "Profile:       $PROFILE  —  ${PROFILE_DESCRIPTIONS[$PROFILE]}"
-echo "Bottom mask:   ${MASK_PIXELS}px  ($MASK_SOURCE)"
-echo "Scale:         $([ "$SCALE_FACTOR" -gt 1 ] && echo "${SCALE_FACTOR}x lanczos" || echo "none (native resolution)")"
-echo "Sharpen:       $([ "$SHARPEN" == true ] && echo "yes (unsharp=3:3:0.3)" || echo "no")"
-echo "bwdif mode:    $([ "$BWDIF_MODE" -eq 1 ] && echo "1 (field-rate ~60fps, default)" || echo "0 (frame-rate ~30fps, --mode0)")"
-echo "CRF:           $CRF_VALUE"
-echo "Audio:         $([ "$FORCE_AAC" == true ] && echo "AAC 192k (--aac)" || echo "lossless copy (default)")"
-echo "Test mode:     $([ "$TEST_MODE" == true ] && echo "yes (first 30s only)" || echo "no")"
-if [[ -n "$DAR_OVERRIDE" ]]; then
-    echo "DAR override:  $DAR_OVERRIDE"
-fi
-echo "========================================="
-echo ""
-echo "  Probing will now run to detect scan type, field order, timestamps,"
-echo "  and display aspect ratio. This is fast unless idet pixel analysis"
-echo "  is needed (only if all structural detection tiers fail)."
-echo ""
-read -p "Arguments look correct? Proceed to probe? (y/n): " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Cancelled. Adjust arguments and re-run."
-    exit 0
-fi
-
-# --- 8. Probe: Codec, Dimensions, FPS, Pixel Format, Field Order, SAR ---
+# --- 9. Probe: Codec, Dimensions, FPS, Pixel Format, Field Order, SAR ---
 echo ""
 echo "--- Step 1: Probing source ---"
 
@@ -462,7 +483,7 @@ echo "  FPS:        $STREAM_FPS ($SOURCE_FPS_FLOAT)"
 echo "  Audio:      ${AUDIO_FORMAT:-none}"
 echo "  SAR:        ${SRC_SAR:-not set}"
 
-# --- 9. Broken Timestamp Detection ---
+# --- 10. Broken Timestamp Detection ---
 # Hauppauge and some AVI muxers write absurd DTS values that produce durations
 # > 24 hours. MKV stream duration is often simply absent (0). Both require
 # falling through to a better duration source and trigger +genpts on encode.
@@ -564,7 +585,7 @@ if [[ "$NEEDS_GENPTS" == true ]]; then
     echo "  [INFO] Broken/missing stream timestamps — enabling PTS regeneration (+genpts)."
 fi
 
-# --- 10. Interlace and Field Order Detection ---
+# --- 11. Interlace and Field Order Detection ---
 # Priority mirrors probe_video.py detect_interlace():
 #   1. DV codec shortcut
 #   2. ffprobe stream field_order metadata
@@ -749,7 +770,7 @@ else
     fi
 fi
 
-# --- 11. Source FPS and Profile Variant Selection ---
+# --- 12. Source FPS and Profile Variant Selection ---
 # Auto-detect 60fps master unless overridden by --60fps.
 # The 45fps threshold cleanly separates 29.97/25fps from 59.94/50fps masters.
 IS_60FPS=false
@@ -771,7 +792,7 @@ else
     FPS_LABEL="src≤45fps hqdn3d variant"
 fi
 
-# --- 12. Audio Strategy ---
+# --- 13. Audio Strategy ---
 # MP4 does not support PCM audio. When PCM is detected the output container
 # is switched to MKV, which supports PCM natively, and audio is stream-copied
 # bit-for-bit. Use --aac to force AAC and keep an MP4 container instead.
@@ -789,7 +810,7 @@ else
     CONTAINER="mp4"
 fi
 
-# --- 13. DAR (Display Aspect Ratio) Auto-Detection ---
+# --- 14. DAR (Display Aspect Ratio) Auto-Detection ---
 #
 # Priority:
 #   1. --dar override (user always wins)
@@ -861,7 +882,7 @@ else
 fi
 echo "  DAR: $DAR_LABEL"
 
-# --- 14. Lanczos Upscale and Optional Sharpen ---
+# --- 15. Lanczos Upscale and Optional Sharpen ---
 # Scale and sharpen are kept separate from PREFILTER_VF so they can be
 # appended AFTER the drawbox mask in the filter chain (step 16).
 # This ensures drawbox operates at source resolution — matching prepare_video.sh —
@@ -882,7 +903,7 @@ if [[ "$SHARPEN" == true ]]; then
     fi
 fi
 
-# --- 15. Path and Filename Setup ---
+# --- 16. Path and Filename Setup ---
 BASE_NAME=$(basename "$SOURCE_INPUT")
 FILE_STEM="${BASE_NAME%.*}"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -905,7 +926,7 @@ else
     TEST_LABEL=""
 fi
 
-# --- 16. Build Filter Chain ---
+# --- 17. Build Filter Chain ---
 # Order: deinterlace -> format=yuv420p -> profile filters -> mask -> scale -> sharpen
 #
 # bwdif must precede format=yuv420p — it operates on the interlaced field
@@ -933,7 +954,7 @@ if [[ -n "$POSTFILTER_VF" ]]; then
     FILTER_CHAIN="${FILTER_CHAIN},${POSTFILTER_VF}"
 fi
 
-# --- 17. Pre-Flight Summary ---
+# --- 18. Pre-Flight Summary ---
 echo ""
 echo "========================================="
 echo "       PRE-FLIGHT SUMMARY${TEST_LABEL}"
@@ -956,7 +977,7 @@ fi
 echo "Bottom Mask:   ${MASK_PIXELS}px  ($MASK_SOURCE)"
 echo "Profile:       $PROFILE ($FPS_LABEL variant)  —  ${PROFILE_DESCRIPTIONS[$PROFILE]}"
 echo "Upscale:       $([ "$SCALE_FACTOR" -gt 1 ] && echo "${SCALE_FACTOR}x lanczos" || echo "none (--scale 1)")"
-echo "Sharpen:       $([ "$SHARPEN" == true ] && echo "yes (unsharp=3:3:0.3)" || echo "no")"
+echo "Sharpen:       $SHARPEN_LABEL"
 echo "DAR:           $DAR_LABEL"
 echo "CRF:           $CRF_VALUE"
 echo "Audio:         $AUDIO_PLAN"
@@ -978,7 +999,7 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# --- 18. Encode ---
+# --- 19. Encode ---
 echo ""
 echo "--- Step 5: Encoding ---"
 echo "Output: $OUTPUT_FILE"

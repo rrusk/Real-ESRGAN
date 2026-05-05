@@ -25,6 +25,10 @@
 #
 #   v3 -- Changed --format dv2 to --format dv1.
 #
+#   v6 -- Changed --format dv1 to --format raw: raw .dv files seek
+#         cleanly in VLC and can be trimmed with dd without AVI container
+#         overhead or index rebuilding issues.
+#
 #   v2 -- Applied three fixes from capture_tape.sh v32/v33/v34:
 #         - v32 subline fix: awk now splits each \r-record on \n and processes
 #           sublines independently. Fixes progress output stopping after the
@@ -138,7 +142,7 @@ usage() {
     echo ""
     echo "Examples:"
     echo "  $0 VHS001"
-    echo "     -> ${CAPTURE_ROOT}/VHS001_20250319_1430/VHS001_20250319_1430001.avi"
+    echo "     -> ${CAPTURE_ROOT}/VHS001_20250319_1430/VHS001_20250319_1430001.dv"
     echo ""
     echo "  $0 -d 37:00 VHS001 'Home Movies 1992'"
     echo "     Stops automatically after 37 minutes."
@@ -327,7 +331,7 @@ fi
 # 6. Flag Configuration
 # ==============================================================================
 FLAGS=(
-    --format dv1     # Type 1 AVI -- single integrated DV track avoids
+    --format raw     # Raw DV stream -- seeks cleanly in VLC, trims instantly
                      # the audio sync drift seen with dv2's separate track
     --size 0         # Single large file; no size-based splitting
     --autosplit      # Split on signal loss (e.g. VCR pause or tape end)
@@ -517,11 +521,11 @@ echo "---------------------------------------------------------"
 echo "RUNNING DATA INTEGRITY AUDIT..."
 
 shopt -s nullglob
-AVI_FILES=("$OUTPUT_DIR"/*.avi)
+DV_FILES=("$OUTPUT_DIR"/*.dv)
 shopt -u nullglob
 
-if [ "${#AVI_FILES[@]}" -eq 0 ]; then
-    echo "[ERROR] No AVI file was generated. Check $LOG_FILE" | tee -a "$LOG_FILE"
+if [ "${#DV_FILES[@]}" -eq 0 ]; then
+    echo "[ERROR] No DV file was generated. Check $LOG_FILE" | tee -a "$LOG_FILE"
     echo "        Possible causes:"
     echo "          - TRV330 was not in A/V passthrough mode"
     echo "          - VCR was not playing before capture started"
@@ -537,10 +541,10 @@ FFPROBE_FALLBACK_NOTED=0
 {
     echo "DATA INTEGRITY AUDIT: $BASE_NAME"
     echo "Generated: $(date)"
-    echo "Files: ${#AVI_FILES[@]}"
+    echo "Files: ${#DV_FILES[@]}"
     echo "---------------------------------------------------------"
 
-    for AVI_FILE in $(printf '%s\n' "${AVI_FILES[@]}" | sort); do
+    for AVI_FILE in $(printf '%s\n' "${DV_FILES[@]}" | sort); do
 
         STATS=$(ffprobe -v error -show_entries format=duration,bit_rate \
             -of default=noprint_wrappers=1 "$AVI_FILE" 2>&1 \
@@ -564,7 +568,7 @@ FFPROBE_FALLBACK_NOTED=0
                 BITRATE=$(echo "scale=0; ($FILE_SIZE * 8) / $DURATION" | bc)
                 BITRATE_MBPS=$(echo "scale=2; $BITRATE / 1000000" | bc)
                 if [[ "$FFPROBE_FALLBACK_NOTED" -eq 0 ]]; then
-                    echo "[INFO] Bitrate calculated from file size (ffprobe returned N/A — normal for DV/AVI)."
+                    echo "[INFO] Bitrate calculated from file size (ffprobe returned N/A — normal for DV)."
                     FFPROBE_FALLBACK_NOTED=1
                 fi
             fi
@@ -615,7 +619,7 @@ FFPROBE_FALLBACK_NOTED=0
     echo "Total duration: ${TOTAL_HMS}  |  Total size: ${TOTAL_GiB} GiB  |  Overall bitrate: ${OVERALL_MBPS} Mbps"
     echo ""
     if [[ "$WARN_COUNT" -eq 0 ]]; then
-        echo "[SUCCESS] All ${#AVI_FILES[@]} file(s) passed integrity check."
+        echo "[SUCCESS] All ${#DV_FILES[@]} file(s) passed integrity check."
     else
         echo "[!!!] WARNING: ${WARN_COUNT} file(s) flagged above. Check $LOG_FILE for dropped frames."
         echo "      In passthrough mode low bitrate may indicate a weak A/V input signal"

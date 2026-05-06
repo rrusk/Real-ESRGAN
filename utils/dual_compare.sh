@@ -1028,6 +1028,21 @@ echo ""
 echo "============================================="
 echo "  Phase 3: Synchronized playback"
 echo "============================================="
+echo ""
+if [[ -z "$NO_DEINTERLACE" ]]; then
+    if [[ "$LEFT_VF" == "bwdif" ]]; then
+        echo "  [Deinterlace] Left  : interlaced — bwdif applied"
+    else
+        echo "  [Deinterlace] Left  : progressive — no filter"
+    fi
+    if [[ "$RIGHT_VF" == "bwdif" ]]; then
+        echo "  [Deinterlace] Right : interlaced — bwdif applied"
+    else
+        echo "  [Deinterlace] Right : progressive — no filter"
+    fi
+else
+    echo "  [Deinterlace] Disabled (--no-deinterlace)"
+fi
 
 # Read confirmed offset if coming via resume path
 if [[ -z "${CONFIRMED_OFFSET:-}" ]]; then
@@ -1206,21 +1221,6 @@ else
     OFFSET_DESC="no offset — both start at same position"
 fi
 echo "  Offset: ${CONFIRMED_OFFSET}s  (${OFFSET_DESC})"
-echo ""
-if [[ -z "$NO_DEINTERLACE" ]]; then
-    if [[ "$LEFT_VF" == "bwdif" ]]; then
-        echo "  [Deinterlace] Left  : interlaced — bwdif applied"
-    else
-        echo "  [Deinterlace] Left  : progressive — no filter"
-    fi
-    if [[ "$RIGHT_VF" == "bwdif" ]]; then
-        echo "  [Deinterlace] Right : interlaced — bwdif applied"
-    else
-        echo "  [Deinterlace] Right : progressive — no filter"
-    fi
-else
-    echo "  [Deinterlace] Disabled (--no-deinterlace)"
-fi
 echo ""
 echo "  Controls (click either window for keyboard focus):"
 echo ""

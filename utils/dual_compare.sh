@@ -463,7 +463,17 @@ echo "  Labels: [$LEFT_LABEL] vs [$RIGHT_LABEL]"
 # ------------------------------------------------------------------------------
 probe_interlaced() {
     local FILE="$1"
-    local FIELD_ORDER
+    local CODEC FIELD_ORDER
+    CODEC=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$FILE" 2>/dev/null || echo "unknown")
+    # dvvideo is always interlaced (NTSC BFF); ffprobe reports field_order as
+    # "unknown" for raw DV files so codec_name must be checked explicitly.
+    if [[ "$CODEC" == "dvvideo" ]]; then
+        echo "true"
+        return
+    fi
     FIELD_ORDER=$(ffprobe -v error -select_streams v:0 \
         -show_entries stream=field_order \
         -of default=noprint_wrappers=1:nokey=1 \
@@ -480,21 +490,8 @@ RIGHT_VF=""
 if [[ -z "$NO_DEINTERLACE" ]]; then
     LEFT_INTERLACED=$(probe_interlaced "$LEFT_FILE")
     RIGHT_INTERLACED=$(probe_interlaced "$RIGHT_FILE")
-
-    if [[ "$LEFT_INTERLACED" == "true" ]]; then
-        LEFT_VF="bwdif"
-        echo "  [Deinterlace] Left  : interlaced — bwdif will be applied"
-    else
-        echo "  [Deinterlace] Left  : progressive — no filter needed"
-    fi
-    if [[ "$RIGHT_INTERLACED" == "true" ]]; then
-        RIGHT_VF="bwdif"
-        echo "  [Deinterlace] Right : interlaced — bwdif will be applied"
-    else
-        echo "  [Deinterlace] Right : progressive — no filter needed"
-    fi
-else
-    echo "  [Deinterlace] Disabled (--no-deinterlace)"
+    [[ "$LEFT_INTERLACED"  == "true" ]] && LEFT_VF="bwdif"
+    [[ "$RIGHT_INTERLACED" == "true" ]] && RIGHT_VF="bwdif"
 fi
 
 # ------------------------------------------------------------------------------
@@ -1210,6 +1207,21 @@ else
 fi
 echo "  Offset: ${CONFIRMED_OFFSET}s  (${OFFSET_DESC})"
 echo ""
+if [[ -z "$NO_DEINTERLACE" ]]; then
+    if [[ "$LEFT_VF" == "bwdif" ]]; then
+        echo "  [Deinterlace] Left  : interlaced — bwdif applied"
+    else
+        echo "  [Deinterlace] Left  : progressive — no filter"
+    fi
+    if [[ "$RIGHT_VF" == "bwdif" ]]; then
+        echo "  [Deinterlace] Right : interlaced — bwdif applied"
+    else
+        echo "  [Deinterlace] Right : progressive — no filter"
+    fi
+else
+    echo "  [Deinterlace] Disabled (--no-deinterlace)"
+fi
+echo ""
 echo "  Controls (click either window for keyboard focus):"
 echo ""
 echo "  Playback:"
@@ -1656,6 +1668,13 @@ if ! command -v socat >/dev/null 2>&1; then
     echo "[WARN] socat not found — swap and synchronized controls will not work."
     echo "       Install with: sudo apt install socat"
     echo "       Launching without synchronization..."
+    if [[ -z "$NO_DEINTERLACE" ]]; then
+        [[ "$LEFT_VF"  == "bwdif" ]] && echo "  [Deinterlace] Left  : interlaced — bwdif applied"  || echo "  [Deinterlace] Left  : progressive — no filter"
+        [[ "$RIGHT_VF" == "bwdif" ]] && echo "  [Deinterlace] Right : interlaced — bwdif applied" || echo "  [Deinterlace] Right : progressive — no filter"
+    else
+        echo "  [Deinterlace] Disabled (--no-deinterlace)"
+    fi
+    echo ""
     mpv \
         ${SOFTWARE_RENDER:+--vo=x11} \
         --title="${LEFT_LABEL}" \

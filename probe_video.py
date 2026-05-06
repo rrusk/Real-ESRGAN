@@ -383,6 +383,13 @@ def main():
         print(f"Resolution:   {meta['width']}x{meta['height']}")
         print(f"Frame Rate:   {meta['r_frame_rate']} fps")
         print(f"Pixel Format: {meta['pix_fmt']}")
+        # For DV sources, note the decode-time chroma conversion so the pipeline
+        # log is self-explanatory: the container stores 4:1:1 (yuv411p) but
+        # libavcodec's DV decoder outputs yuv420p on decode. prepare_video.sh
+        # then upsamples to yuv444p to avoid a second lossy subsampling step.
+        if codec_name.startswith('dv') and meta.get('pix_fmt') == 'yuv411p':
+            print(f"              (native DV 4:1:1 — libavcodec decodes to yuv420p;"
+                  f" prepare_video.sh encodes master as yuv444p)")
         print(f"Video Codec:  {codec_name}")
         print(f"Audio Codec:  {audio_display}")
         print(f"Scan Type:    {scan_type}")

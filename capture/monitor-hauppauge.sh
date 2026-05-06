@@ -1,6 +1,41 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# monitor-hauppauge.sh
+# Usage: monitor-hauppauge.sh [--svideo|--composite]
+#
+# Opens a live monitor window from the Hauppauge 610 USB device.
+# If neither --svideo nor --composite is given, prompts interactively.
+#
+# Options:
+#   --svideo      Use S-Video input    (Hauppauge input 1)
+#   --composite   Use Composite input  (Hauppauge input 0)
 
-# --- 1. Dependency Check ---
+set -euo pipefail
+
+# --- 1. Argument Parsing ---
+INPUT_NUM=""
+INPUT_LABEL=""
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --svideo)
+            INPUT_NUM=1
+            INPUT_LABEL="S-Video"
+            shift
+            ;;
+        --composite)
+            INPUT_NUM=0
+            INPUT_LABEL="Composite"
+            shift
+            ;;
+        *)
+            echo "Error: Unknown option: $1"
+            echo "Usage: $0 [--svideo|--composite]"
+            exit 1
+            ;;
+    esac
+done
+
+# --- 2. Dependency Check ---
 # Ensures the required Linux media and audio tools are installed
 MISSING_PKGS=()
 type v4l2-ctl >/dev/null 2>&1 || MISSING_PKGS+=("v4l-utils")
@@ -14,14 +49,14 @@ if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     exit 1
 fi
 
-# --- 2. Robust Hardware Detection ---
+# --- 3. Robust Hardware Detection ---
 # Detect Video: Searches for the Hauppauge block and grabs the /dev/video node
 VIDEO_DEV=$(v4l2-ctl --list-devices 2>/dev/null | grep -iA 5 "Hauppauge" | grep -o "/dev/video[0-9]\+" | head -n 1)
 
 # Detect Audio: Searches for the driver name (Cx231xx) or manufacturer (Hauppauge)
 AUDIO_CARD=$(arecord -l 2>/dev/null | grep -iE "Hauppauge|Cx231xx" | head -n 1 | cut -d' ' -f2 | tr -d ':')
 
-# --- 3. Strict Exit Logic ---
+# --- 4. Strict Exit Logic ---
 # Exit if video hardware is missing
 if [ -z "$VIDEO_DEV" ]; then
     echo "Error: Hauppauge video device not found. Is it plugged in?"
@@ -35,15 +70,36 @@ if [ -z "$AUDIO_CARD" ]; then
     exit 1
 fi
 
+# --- 5. Hardware Initialization ---
 AUDIO_DEV="hw:${AUDIO_CARD},0"
 echo "Hardware Verified: Video=$VIDEO_DEV | Audio=$AUDIO_DEV"
 
-# --- 4. Hardware Initialization ---
-# Enforce S-Video (Input 1) and NTSC standard
-v4l2-ctl -d "$VIDEO_DEV" -i 1 >/dev/null 2>&1
+# If input was not specified on the command line, prompt interactively.
+if [[ -z "$INPUT_NUM" ]]; then
+    echo "Select video input:"
+    echo "  1) S-Video    (use when VCR has a separate S-Video output)"
+    echo "  2) Composite  (use when VCR has only composite, or S-Video clips)"
+    printf "Choice [1/2]: "
+    local_choice=""
+    read -r local_choice </dev/tty
+    case "$local_choice" in
+        1) INPUT_NUM=1; INPUT_LABEL="S-Video"    ;;
+        2) INPUT_NUM=0; INPUT_LABEL="Composite"  ;;
+        *)
+            echo "Error: please enter 1 for S-Video or 2 for Composite."
+            exit 1
+            ;;
+    esac
+    echo ""
+fi
+
+echo "Input:      ${INPUT_LABEL} (V4L2 input ${INPUT_NUM})"
+
+# Set selected input and enforce NTSC standard.
+v4l2-ctl -d "$VIDEO_DEV" -i "$INPUT_NUM" >/dev/null 2>&1
 v4l2-ctl -d "$VIDEO_DEV" -s ntsc >/dev/null 2>&1
 
-# --- 5. Launch Live Monitor ---
+# --- 6. Launch Live Monitor ---
 # Simple pipe to avoid ESM library and argument parsing errors
 ffmpeg -hide_banner -loglevel error \
     -f v4l2 -i "$VIDEO_DEV" \

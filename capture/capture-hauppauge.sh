@@ -311,11 +311,16 @@ echo "--------------------------------------------------------"
 # Using FFV1 version 3 for archival stability.
 # Archive is written as FFV1 lossless to the MKV file.
 # The NUT pipe to ffplay provides the live monitor with audio.
+# 2026-05-06: -pix_fmt yuyv422 -> yuv422p. yuyv422 is a packed V4L2 capture
+#             format, not an archival format. yuv422p is the correct planar
+#             4:2:2 representation — the conversion is lossless (no chroma
+#             discarded) and yuv422p is handled correctly by all downstream
+#             pipeline tools and ffprobe.
 ffmpeg -hide_banner -loglevel error \
        -f v4l2 -thread_queue_size 2048 -video_size 720x480 -i "$VIDEO_DEV" \
        -f alsa -thread_queue_size 2048 -i "$AUDIO_DEV" \
        -t "$DUR_SECS" \
-       -c:v ffv1 -level 3 -coder 1 -context 1 -pix_fmt yuyv422 \
+       -c:v ffv1 -level 3 -coder 1 -context 1 -pix_fmt yuv422p \
        -c:a pcm_s16le \
        -f tee -map 0:v -map 1:a \
        "$OUTPUT_FILE|[f=nut]pipe:1" | ffplay -i - -window_title "RECORDING MONITOR" -autoexit

@@ -88,6 +88,7 @@ SOFTWARE_RENDER=""  # set to 1 with --software-render to use x11 vo (safe with C
 REALIGN_THRESHOLD=15  # minutes from last calibration before offering blink realign on resume
 DISPLAY_SCREEN=""   # xrandr output name to place mpv windows on (e.g. HDMI-1, DP-1);
                     # default is the primary display.  Use --screen to override.
+NO_DEINTERLACE=""   # set to 1 with --no-deinterlace to suppress automatic bwdif filter
 
 # ------------------------------------------------------------------------------
 # Argument parsing
@@ -111,6 +112,10 @@ Options:
   --right-label LABEL Display label for right input
   --software-render       Use x11 software rendering (no GPU). Safe to run alongside
                           CUDA pipelines. Default is GPU rendering (--vo=gpu).
+  --no-deinterlace        Suppress automatic bwdif deinterlacing. By default each
+                          input is probed and bwdif is applied when interlacing is
+                          detected, matching normal viewer behaviour. Use this flag
+                          to inspect the raw interlaced signal.
   --screen NAME           xrandr output name to place mpv windows on (e.g. HDMI-1,
                           DP-1, DP-2). Default: primary display. Run 'xrandr' to
                           list connected outputs and their names.
@@ -147,6 +152,7 @@ while [[ "$#" -gt 0 ]]; do
         --blink)            BLINK_SCRIPT="$2";         shift 2 ;;
         --find-offset)      FIND_OFFSET_SCRIPT="$2";   shift 2 ;;
         --software-render)      SOFTWARE_RENDER=1;                shift   ;;
+        --no-deinterlace)       NO_DEINTERLACE=1;                 shift   ;;
         --screen)               DISPLAY_SCREEN="$2";              shift 2 ;;
         --realign-threshold)    REALIGN_THRESHOLD="$2";           shift 2 ;;
         --blink-frames)         BLINK_FRAMES="$2";                shift 2 ;;
@@ -448,6 +454,48 @@ echo ""
 echo "  Left  : $LEFT_FILE"
 echo "  Right : $RIGHT_FILE"
 echo "  Labels: [$LEFT_LABEL] vs [$RIGHT_LABEL]"
+
+# ------------------------------------------------------------------------------
+# Interlace detection — probe each input and apply bwdif in mpv when needed.
+# ffprobe reports field_order from the container/stream header; values other
+# than "progressive" and "unknown" indicate interlaced content.
+# --no-deinterlace suppresses this for diagnostic inspection of raw signal.
+# ------------------------------------------------------------------------------
+probe_interlaced() {
+    local FILE="$1"
+    local FIELD_ORDER
+    FIELD_ORDER=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=field_order \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$FILE" 2>/dev/null || echo "unknown")
+    case "$FIELD_ORDER" in
+        progressive|unknown|"") echo "false" ;;
+        *)                       echo "true"  ;;
+    esac
+}
+
+LEFT_VF=""
+RIGHT_VF=""
+
+if [[ -z "$NO_DEINTERLACE" ]]; then
+    LEFT_INTERLACED=$(probe_interlaced "$LEFT_FILE")
+    RIGHT_INTERLACED=$(probe_interlaced "$RIGHT_FILE")
+
+    if [[ "$LEFT_INTERLACED" == "true" ]]; then
+        LEFT_VF="bwdif"
+        echo "  [Deinterlace] Left  : interlaced — bwdif will be applied"
+    else
+        echo "  [Deinterlace] Left  : progressive — no filter needed"
+    fi
+    if [[ "$RIGHT_INTERLACED" == "true" ]]; then
+        RIGHT_VF="bwdif"
+        echo "  [Deinterlace] Right : interlaced — bwdif will be applied"
+    else
+        echo "  [Deinterlace] Right : progressive — no filter needed"
+    fi
+else
+    echo "  [Deinterlace] Disabled (--no-deinterlace)"
+fi
 
 # ------------------------------------------------------------------------------
 # Session directory — named from input stems, lives under COMPARE_DIR
@@ -1613,6 +1661,7 @@ if ! command -v socat >/dev/null 2>&1; then
         --title="${LEFT_LABEL}" \
         --geometry="${WIN_W}x${WIN_H}+${LEFT_X}+${SCREEN_Y}" \
         --start="$LEFT_START" \
+        ${LEFT_VF:+--vf=$LEFT_VF} \
         "$LEFT_FILE" &
     sleep 0.5
     mpv \
@@ -1620,6 +1669,7 @@ if ! command -v socat >/dev/null 2>&1; then
         --title="${RIGHT_LABEL}" \
         --geometry="${WIN_W}x${WIN_H}+${RIGHT_X}+${SCREEN_Y}" \
         --start="$RIGHT_START" \
+        ${RIGHT_VF:+--vf=$RIGHT_VF} \
         "$RIGHT_FILE" &
     echo "  Both players launched (unsynchronized)."
     wait
@@ -1644,6 +1694,7 @@ mpv \
     --start="$LEFT_START" \
     --hr-seek=yes \
     --af="lavfi=[pan=stereo|FL=0.5*FL+0.5*FR|FR=0]" \
+    ${LEFT_VF:+--vf=$LEFT_VF} \
     --pause \
     "$LEFT_FILE" &
 LEFT_PID=$!
@@ -1667,6 +1718,7 @@ mpv \
     --start="$RIGHT_START" \
     --hr-seek=yes \
     --af="lavfi=[pan=stereo|FL=0|FR=0.5*FL+0.5*FR]" \
+    ${RIGHT_VF:+--vf=$RIGHT_VF} \
     --pause \
     "$RIGHT_FILE" &
 RIGHT_PID=$!

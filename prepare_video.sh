@@ -36,15 +36,6 @@ set -euo pipefail
 
 main() {
 
-# 0. Virtual Environment Guard ---
-# Ensures consistent tool versions (ffmpeg, python) across the pipeline.
-if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-    echo -e "\n[!] WARNING: Virtual environment not detected."
-    echo "    This pipeline requires specific versions (e.g., numpy<2.0) found in venv."
-    echo "    Recommended: source venv/bin/activate"
-    echo "    Continuing without venv — tool versions are not guaranteed."
-fi
-
 # 1. Argument Check
 # Validates input count and provides detailed help documentation.
 if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
@@ -177,9 +168,39 @@ SOURCE_CODEC=$(ffprobe -v error -select_streams v:0 \
     -show_entries stream=codec_name \
     -of default=noprint_wrappers=1:nokey=1 \
     "$SOURCE_INPUT" 2>/dev/null)
+SOURCE_PIX_FMT=$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=pix_fmt \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$SOURCE_INPUT" 2>/dev/null)
+# SOURCE_PIX_FMT reflects the container/stream pixel format as ffprobe reports
+# it — for DV this is yuv411p (the native DV chroma), not the yuv420p that
+# libavcodec outputs on decode. This is intentional: we want to show the user
+# what the source actually contains, not what the decoder produces internally.
 IS_DV_SOURCE=false
 if [[ "$SOURCE_CODEC" == dv* ]]; then
     IS_DV_SOURCE=true
+fi
+
+# Hi8 Default Mask
+# Hi8 analog captures via DV converter reliably produce 8 pixels of
+# head-switching noise at the bottom edge. Apply a default mask of 8 when:
+#   - no mask was explicitly supplied on the command line (MASK_PIXELS == 0)
+#   - the source codec is dvvideo (IS_DV_SOURCE set below, but filename is
+#     available here; codec check is repeated after SOURCE_CODEC is probed)
+#   - the filename begins with "hi8" (case-insensitive), matching the capture
+#     naming convention: hi8_YYYYMMDD-YYYYMMDD.dv / hi8dv_...
+#
+# Pure MiniDV sources (no analog conversion) do not have head-switching noise
+# and are not named with a "hi8" prefix, so they are unaffected.
+#
+# Pass mask_pixels=0 explicitly on the command line to suppress this default.
+HI8_MASK_APPLIED=false
+if [[ "$MASK_PIXELS" -eq 0 ]]; then
+    BASE_FOR_MASK=$(basename "$SOURCE_INPUT")
+    if [[ "${BASE_FOR_MASK,,}" == hi8* ]]; then
+        MASK_PIXELS=8
+        HI8_MASK_APPLIED=true
+    fi
 fi
 
 BASE_NAME=$(basename "$SOURCE_INPUT")
@@ -348,10 +369,15 @@ echo -e "\n========================================="
 echo "       PRE-FLIGHT SUMMARY$TEST_LABEL"
 echo "========================================="
 echo "Source File:   $SOURCE_INPUT"
-echo "Source Codec:  $SOURCE_CODEC"
+echo "Source Codec:  $SOURCE_CODEC  |  Pixel fmt: $SOURCE_PIX_FMT"
 echo "Output File:   $PROG_OUTPUT"
+echo "Output Chroma: yuv444p  (upsampled from decoded $SOURCE_PIX_FMT — avoids second chroma subsampling round-trip)"
 echo "Audio Plan:    $AUDIO_PLAN"
-echo "Bottom Mask:   ${MASK_PIXELS} pixels"
+if [[ "$HI8_MASK_APPLIED" == true ]]; then
+    echo "Bottom Mask:   ${MASK_PIXELS} pixels  (auto-applied: hi8 filename prefix detected — pass 0 to suppress)"
+else
+    echo "Bottom Mask:   ${MASK_PIXELS} pixels"
+fi
 echo "CRF:           ${CRF_VALUE}"
 
 if [ "$IS_INTERLACED" = true ]; then

@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
 # vhs_quality.sh
-# Usage: ./vhs_quality.sh [--sample SECONDS] [--no-histogram] [--histogram-only] <capture_a> [capture_b]
+# Usage: ./vhs_quality.sh [--sample SECONDS] [--no-histogram] [--histogram-only] <session_dir_a> [session_dir_b]
 #
-# With ONE file: produces a single-capture report focused on brightness
+# Each argument is a capture session directory produced by capture_passthrough.sh
+# or capture_tape.sh.  The directory must contain exactly one .dv file and
+# should contain the dvgrab .log file of the same base name.  The .dv file and
+# .log file are resolved automatically; no need to specify file paths directly.
+#
+# If multiple .dv files are found (should not happen for VCR sessions — the VCR
+# is never paused) a warning is emitted and the first file (segment 001) is used.
+# If the dvgrab .log is absent the integrity check falls back to frame-count
+# arithmetic with a note; all other analysis proceeds normally.
+#
+# With ONE directory: produces a single-capture report focused on brightness
 # calibration metrics (mean_yavg, widespread_clip, highlight_var, YMAX and
 # YAVG distributions).  Useful for confirming whether a Hauppauge brightness
 # setting is attenuating the signal correctly before committing to a full
 # 37-minute capture.
 #
-# With TWO files: analyses both captures independently, aligns them by audio
-# peak, and produces a side-by-side report plus paired-frame analysis.
+# With TWO directories: analyses both captures independently, aligns them by
+# audio peak, and produces a side-by-side report plus paired-frame analysis.
 #
 # Options:
 #   --sample SECONDS   Analyse only the first SECONDS seconds of each file.
@@ -35,13 +45,13 @@
 # Dependencies: ffmpeg (with signalstats, astats, ametadata filters), awk,
 #               python3 with numpy (for histogram; install: sudo apt install python3-numpy)
 #
-# Output directory: placed inside the video's own directory (single-file mode)
+# Output directory: placed inside session_dir_a (single-session mode)
 #   a_stats.log         - per-frame signalstats for capture A
 #   a_aligned.log       - a_stats.log (copy; trimmed in two-file mode)
 #   dropouts_a.txt      - frames flagged as dropouts in A
 #   report.txt          - quality report including luma histogram bright-end summary
 #   luma_hist_a.txt     - full luma histogram for A (skipped with --no-histogram)
-#   [two-file mode only:]
+#   [two-session mode only:]
 #   b_stats.log, b_aligned.log, dropouts_b.txt, paired_frames.txt
 #   luma_hist_b.txt     - full luma histogram for B (skipped with --no-histogram)
 
@@ -53,6 +63,40 @@ set -euo pipefail
 SAMPLE_DURATION=""   # empty = full file; set to seconds string if --sample given
 RUN_HISTOGRAM=1      # 1 = run by default; 0 = skip (--no-histogram)
 HISTOGRAM_ONLY=0     # 1 = skip Steps 1-6, run only integrity check + histogram
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS] <session_dir_a> [session_dir_b]
+
+Each argument is a capture session directory produced by capture_passthrough.sh
+or capture_tape.sh, containing one .dv file and the dvgrab .log of the same
+base name.  Files are resolved automatically from the directory.
+
+With ONE directory : single-capture brightness calibration report.
+With TWO directories: side-by-side comparison with paired-frame analysis.
+
+Options:
+  --sample SECONDS    Analyse only the first SECONDS seconds of each file.
+                      Useful for a quick indicative result before a full run.
+                      (37 min DV ≈ 15-25 min analysis; 120s sample ≈ 1 min.)
+
+  --no-histogram      Skip the luma pixel histogram (requires python3-numpy).
+                      Use when you only need signalstats metrics.
+
+  --histogram-only    Run only the integrity check and pixel histogram,
+                      skipping all signalstats processing (Steps 1-6).
+                      Approximately half the runtime of a full run.
+
+  -h, --help          Show this help and exit.
+
+Output is written to a timestamped subdirectory inside session_dir_a.
+
+Dependencies:
+  ffmpeg (with signalstats, astats, ametadata, extractplanes filters)
+  ffprobe, awk, python3, python3-numpy (numpy required for histogram)
+  Install numpy with: sudo apt install python3-numpy
+EOF
+}
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -73,13 +117,17 @@ while [[ "$#" -gt 0 ]]; do
             HISTOGRAM_ONLY=1
             shift
             ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
         --)
             shift
             break
             ;;
         -*)
             echo "[ERROR] Unknown option: $1"
-            echo "Usage: $0 [--sample SECONDS] [--no-histogram] [--histogram-only] <capture_a> [capture_b]"
+            usage
             exit 1
             ;;
         *)
@@ -89,12 +137,66 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 [--sample SECONDS] <capture_a> [capture_b]"
+    usage
     exit 1
 fi
 
-A="$1"
-B="${2:-}"
+# ------------------------------------------------------------------------------
+# resolve_session DIR LABEL
+# Resolves a capture session directory to its .dv file and dvgrab .log file.
+# Sets the caller's DV_FILE and DVGRAB_LOG variables (via echo; caller uses
+# read to capture).  Prints warnings for unexpected conditions but only exits
+# on hard errors (no .dv file found).
+#
+# Expected directory contents (from capture_passthrough.sh / capture_tape.sh):
+#   SESSION/SESSION001.dv   — raw DV stream (single file for VCR sessions)
+#   SESSION/SESSION.log     — dvgrab progress and integrity log
+# ------------------------------------------------------------------------------
+resolve_session() {
+    local DIR="$1"
+    local LABEL="$2"
+
+    [[ -d "$DIR" ]] || { echo "[ERROR] Capture $LABEL: not a directory: $DIR" >&2; exit 1; }
+
+    local -a dv_files log_files
+    mapfile -t dv_files  < <(find "$DIR" -maxdepth 1 -name "*.dv"  | sort)
+    mapfile -t log_files < <(find "$DIR" -maxdepth 1 -name "*.log" | sort)
+
+    case "${#dv_files[@]}" in
+        0)
+            echo "[ERROR] Capture $LABEL: no .dv file found in $DIR" >&2
+            exit 1
+            ;;
+        1)  ;;
+        *)
+            echo "[WARN]  Capture $LABEL: ${#dv_files[@]} .dv files found in $DIR" >&2
+            echo "        This should not happen for VCR sessions (VCR is never paused)." >&2
+            echo "        Proceeding with first file: ${dv_files[0]}" >&2
+            ;;
+    esac
+
+    case "${#log_files[@]}" in
+        0)
+            echo "[WARN]  Capture $LABEL: no dvgrab .log found in $DIR" >&2
+            echo "        Integrity check will use frame-count arithmetic only." >&2
+            ;;
+        1)  ;;
+        *)
+            echo "[WARN]  Capture $LABEL: ${#log_files[@]} .log files found in $DIR — using first: ${log_files[0]}" >&2
+            ;;
+    esac
+
+    # Return resolved paths via stdout as two tab-separated fields.
+    printf '%s\t%s\n' "${dv_files[0]}" "${log_files[0]:-}"
+}
+
+# Resolve session directories into .dv paths and dvgrab log paths.
+{ read -r A DVGRAB_LOG_A; } < <(resolve_session "$1" "A")
+B=""
+DVGRAB_LOG_B=""
+if [ "$#" -ge 2 ]; then
+    { read -r B DVGRAB_LOG_B; } < <(resolve_session "$2" "B")
+fi
 
 # SINGLE_MODE=1 when only one capture is provided.  Steps that require two
 # files (audio alignment, B signalstats, log trimming, paired analysis) are
@@ -102,13 +204,6 @@ B="${2:-}"
 # summary rather than a side-by-side comparison.
 SINGLE_MODE=0
 [ -z "$B" ] && SINGLE_MODE=1
-
-for f in "$A" ${B:+"$B"}; do
-    if [ ! -f "$f" ]; then
-        echo "[ERROR] File not found: $f"
-        exit 1
-    fi
-done
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -120,8 +215,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 #                both file stems to make the comparison self-documenting.
 #                e.g. VHS_Jive_..._vs_VHS_Jive_..._quality_20260428_094641/
 if [ "$SINGLE_MODE" -eq 1 ]; then
-    A_DIR=$(dirname "$A")
-    W="${A_DIR}/vhs_quality_${TIMESTAMP}"
+    W="${1}/vhs_quality_${TIMESTAMP}"
 else
     A_STEM=$(basename "${A%.*}")
     B_STEM=$(basename "${B%.*}")
@@ -183,29 +277,43 @@ confirm_continue() {
 }
 
 # ------------------------------------------------------------------------------
-# Helper: check_integrity INFILE ACTUAL_FRAMES LABEL
-# Uses ffprobe to determine the expected frame count from the container
-# duration and frame rate, then compares against the actual decoded frame
-# count from the signalstats log.  A significant shortfall indicates dropped
-# frames during capture (USB buffer overrun, disk too slow, etc.).
-# In --histogram-only mode ACTUAL_FRAMES is derived from ffprobe directly.
-# Tolerance of 5 frames allows for rounding and end-of-stream variation.
-# Prints a one-line result and returns 0 if OK, 1 if frames are missing.
+# Helper: check_integrity INFILE ACTUAL_FRAMES LABEL DVGRAB_LOG
+# Primary method: if DVGRAB_LOG is provided, counts "damaged frame" lines
+# reported by dvgrab — these are authoritative FireWire transport failures.
+# Fallback (no log): for raw .dv files uses file size / 120000 (exact, no
+# decoding needed); for other containers uses duration × fps from ffprobe.
+# The fallback is unreliable in two-file mode after alignment trimming and
+# is labelled as an estimate in that case.
+# Tolerance of 5 frames applies to the fallback path only.
 # ------------------------------------------------------------------------------
 check_integrity() {
     local INFILE="$1"
     local ACTUAL="$2"
     local LABEL="$3"
-    local TOLERANCE=5
+    local DVGRAB_LOG="${4:-}"
 
+    # --- Primary: dvgrab log ---
+    if [[ -n "$DVGRAB_LOG" && -f "$DVGRAB_LOG" ]]; then
+        local DROP_COUNT
+        DROP_COUNT=$(grep -c "damaged frame" "$DVGRAB_LOG" 2>/dev/null || echo "0")
+        if [ "$DROP_COUNT" -eq 0 ]; then
+            echo "  ${LABEL}: OK — no damaged frames in dvgrab log"
+        else
+            echo "  ${LABEL}: WARNING — ${DROP_COUNT} damaged frame(s) reported by dvgrab (FireWire transport errors)"
+        fi
+        return 0
+    fi
+
+    # --- Fallback: frame-count arithmetic ---
+    echo "  ${LABEL}: (no dvgrab log — using frame-count estimate)"
+    local TOLERANCE=5
     local ext EXPECTED MISSING
     ext="${INFILE##*.}"
 
     if [[ "${ext,,}" == "dv" ]]; then
-        # Raw DV has a fixed frame size of exactly 120,000 bytes per NTSC frame.
-        # File size / 120000 gives the exact frame count instantly with no
-        # decoding or ffprobe needed.  Any remainder indicates a partial frame
-        # at the end of the file (truncated write / power loss during capture).
+        # Raw DV: fixed frame size of 120,000 bytes per NTSC frame.
+        # File size / 120000 gives exact frame count with no decoding needed.
+        # Any remainder indicates a partial frame (truncated capture).
         local FILESIZE REMAINDER
         FILESIZE=$(stat -c%s "$INFILE" 2>/dev/null || echo "0")
         REMAINDER=$(( FILESIZE % 120000 ))
@@ -221,17 +329,13 @@ check_integrity() {
             echo "  ${LABEL}: Partial frame at end of file — capture may have been truncated."
         fi
     else
-        # For MKV, AVI, and other containers use nb_frames from the container
-        # index, falling back to duration × fps.
+        # MKV/AVI: nb_frames from container index, falling back to duration × fps.
         #
-        # LIMITATION: For Hauppauge FFV1/MKV captures, this check detects
-        # frames missing from the container but cannot detect duplicate frames
-        # (where the capture device repeated a frame to fill a gap caused by
-        # USB buffer overrun).  Duplicated frames leave the container frame
-        # count correct while silently degrading the capture.  The signalstats
-        # YDIF metric in the full vhs_quality.sh run will show anomalously low
-        # inter-frame differences on duplicated frame pairs — check dropout
-        # counts and YDIF distribution if USB overrun is suspected.
+        # LIMITATION: Cannot detect duplicate frames (capture device repeating a
+        # frame to fill a gap caused by USB buffer overrun).  Duplicated frames
+        # leave the container frame count correct while silently degrading the
+        # capture.  The signalstats YDIF metric will show anomalously low
+        # inter-frame differences on duplicated frame pairs.
         local DURATION FPS
         DURATION=$(ffprobe -v error -select_streams v:0 \
             -show_entries format=duration \
@@ -259,7 +363,7 @@ check_integrity() {
         return 0
     else
         echo "  ${LABEL}: WARNING — ${ACTUAL} frames decoded, ${EXPECTED} expected — ${MISSING} frames missing"
-        echo "  ${LABEL}: Dropped frames detected. FireWire bandwidth or disk throughput may be insufficient."
+        echo "  ${LABEL}: Possible dropped frames. Provide the dvgrab log for authoritative drop detection."
         return 1
     fi
 }
@@ -327,9 +431,15 @@ PYEOF
     # values were never produced by the integer arithmetic of the rescaling.
     # extractplanes=y passes Y bytes through unchanged, giving a true 1:1
     # histogram of the actual encoded luma values.
+    #
+    # IMPORTANT: crop=720:472:0:0 removes the bottom 8 lines before histogram
+    # accumulation for the same reason as the signalstats crop above — VHS head
+    # switching noise in the bottom lines would inflate the histogram at extreme
+    # luma values and distort the bright-end distribution.
+    # Do NOT remove this crop.
     # shellcheck disable=SC2086
     ffmpeg -i "$INFILE" $DURATION_FLAG \
-        -vf "extractplanes=y" \
+        -vf "crop=720:472:0:0,extractplanes=y" \
         -f rawvideo -pix_fmt gray - 2>/dev/null \
     | python3 "$PYSCRIPT" "$OUTFILE"
 
@@ -453,10 +563,10 @@ if [ "$HISTOGRAM_ONLY" -eq 1 ]; then
 
     echo "[1/2] Checking capture integrity..."
     FA=$(get_frame_count "$A")
-    check_integrity "$A" "$FA" "Capture A" || true
+    check_integrity "$A" "$FA" "Capture A" "$DVGRAB_LOG_A" || true
     if [ "$SINGLE_MODE" -eq 0 ]; then
         FB=$(get_frame_count "$B")
-        check_integrity "$B" "$FB" "Capture B" || true
+        check_integrity "$B" "$FB" "Capture B" "$DVGRAB_LOG_B" || true
     fi
 
     echo ""
@@ -504,17 +614,19 @@ if command -v python3 >/dev/null 2>&1; then
         OFFSET_SEC=$(python3 -c "print(round(${PEAK_A} - ${PEAK_B}, 3))")
         # Round to nearest whole frame at 29.97 fps.
         OFFSET_FRAMES=$(python3 -c "print(round(abs(${PEAK_A} - ${PEAK_B}) * 29.97))")
-        # Positive OFFSET_SEC → A starts later on tape → skip frames from B.
-        # Negative OFFSET_SEC → B starts later on tape → skip frames from A.
+        # Whichever file has its peak later in the file has more content before
+        # the peak and must be trimmed so both logs start at the same tape position.
+        # PEAK_A > PEAK_B → A has more content before the peak → trim A's log.
+        # PEAK_A < PEAK_B → B has more content before the peak → trim B's log.
         if python3 -c "import sys; sys.exit(0 if ${PEAK_A} >= ${PEAK_B} else 1)"; then
-            SKIP_A=0
-            SKIP_B=$OFFSET_FRAMES
-            echo "  B leads A by ${OFFSET_SEC}s = ${OFFSET_FRAMES} frames; B log will be trimmed."
-        else
             SKIP_A=$OFFSET_FRAMES
             SKIP_B=0
+            echo "  A has more content before peak (${PEAK_A}s vs ${PEAK_B}s); A log will be trimmed by ${OFFSET_FRAMES} frames."
+        else
+            SKIP_A=0
+            SKIP_B=$OFFSET_FRAMES
             ABS_SEC=$(python3 -c "print(round(abs(${OFFSET_SEC}), 3))")
-            echo "  A leads B by ${ABS_SEC}s = ${OFFSET_FRAMES} frames; A log will be trimmed."
+            echo "  B has more content before peak (${PEAK_B}s vs ${PEAK_A}s); B log will be trimmed by ${OFFSET_FRAMES} frames."
         fi
     else
         confirm_continue "Peak detection failed (silent or unreadable audio in one or both files). Per-frame logs will NOT be time-aligned."
@@ -567,8 +679,13 @@ fi
 
 echo "  Capture A: $A"
 # shellcheck disable=SC2086
+# IMPORTANT: crop=720:472:0:0 removes the bottom 8 lines of each frame before
+# analysis.  VHS head switching noise appears in the bottom ~8 lines and causes
+# spurious YDIF spikes, elevated YMAX, and inflated dropout counts if not masked.
+# Do NOT remove or simplify this crop — without it quality metrics are corrupted
+# by head switching artefacts that are not representative of picture content.
 ffmpeg -i "$A" $DURATION_FLAG \
-    -vf "signalstats,metadata=print:file=-" \
+    -vf "crop=720:472:0:0,signalstats,metadata=print:file=-" \
     -f null - 2>/dev/null \
     | grep -E "(^frame:|lavfi\.signalstats\.)" > "$W/a_stats.log" || true
 
@@ -580,8 +697,9 @@ fi
 if [ "$SINGLE_MODE" -eq 0 ]; then
 echo "  Capture B: $B"
 # shellcheck disable=SC2086
+# IMPORTANT: crop=720:472:0:0 — see capture A comment above.
 ffmpeg -i "$B" $DURATION_FLAG \
-    -vf "signalstats,metadata=print:file=-" \
+    -vf "crop=720:472:0:0,signalstats,metadata=print:file=-" \
     -f null - 2>/dev/null \
     | grep -E "(^frame:|lavfi\.signalstats\.)" > "$W/b_stats.log" || true
 
@@ -1167,10 +1285,10 @@ _emit_cmd() {
 echo ""
 echo "[5b] Checking capture integrity..."
 INTEGRITY_A_OK=0
-check_integrity "$A" "$FA" "Capture A" || INTEGRITY_A_OK=1
+check_integrity "$A" "$FA" "Capture A" "$DVGRAB_LOG_A" || INTEGRITY_A_OK=1
 if [ "$SINGLE_MODE" -eq 0 ]; then
     INTEGRITY_B_OK=0
-    check_integrity "$B" "$FB" "Capture B" || INTEGRITY_B_OK=1
+    check_integrity "$B" "$FB" "Capture B" "$DVGRAB_LOG_B" || INTEGRITY_B_OK=1
 fi
 
 

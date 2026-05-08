@@ -62,6 +62,13 @@ def parse_raw_chapters(content: str) -> str:
             # No timestamp found; buffer this line as the title for the next line
             current_title_buffer = line
 
+    if current_title_buffer is not None:
+        logger.error(
+            f"Orphaned title with no timestamp: {current_title_buffer!r}. "
+            "Check that every title line is followed by a line ending in MM:SS."
+        )
+        sys.exit(1)
+
     # Generate Output
     output_lines = []
     for i, (name, time) in enumerate(chapters, 1):

@@ -69,6 +69,11 @@ if ! command -v mkvmerge &> /dev/null; then
     exit 1
 fi
 
+if [[ ! -f "$CONVERTER_SCRIPT" ]]; then
+    log "Error: Required script '$CONVERTER_SCRIPT' not found in current directory."
+    exit 1
+fi
+
 # 5. Dynamic Output Naming
 # Extracts filename without extension (e.g., "video.mkv" -> "video")
 BASENAME=$(basename "$INPUT_VIDEO" .mkv)

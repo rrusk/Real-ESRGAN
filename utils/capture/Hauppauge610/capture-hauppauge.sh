@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # capture-hauppauge.sh
-# Usage: capture-hauppauge.sh [--brightness N] [--output-dir DIR] [--svideo|--composite] <SOURCE_ID> [DESCRIPTION]
+# Usage: capture-hauppauge.sh [OPTIONS] [--svideo|--composite] [--output-dir DIR] <SOURCE_ID> [DESCRIPTION]
 #
-# Captures from a Hauppauge 610 USB device to a lossless FFV1/MKV file
-# with a simultaneous live monitor window.
+# Captures from a Hauppauge USB-Live2 (cx231xx) device to a lossless FFV1/MKV
+# file with a simultaneous live monitor window.
 #
 # Output naming follows capture_passthrough.sh conventions:
 #   OUTPUT_DIR/SOURCE_ID[_DESCRIPTION]_TIMESTAMP/
-#       SOURCE_ID[_DESCRIPTION]_TIMESTAMP_INPUT_bBRIGHTNESS.mkv
+#       SOURCE_ID[_DESCRIPTION]_TIMESTAMP_INPUT_bBRIGHTNESS[_cCONTRAST]...mkv
+#
+# Only controls that differ from their hardware defaults are appended to the
+# filename, so a capture at all defaults produces a clean short name.
 #
 # Arguments:
 #   SOURCE_ID      Required on command line or prompted interactively.
@@ -23,21 +26,42 @@
 #   --composite       Use the Composite input (Hauppauge input 0).
 #                     If neither is specified the script prompts interactively.
 #
-#   --brightness N    Set the V4L2 brightness control (0-255, default 128).
-#                     128 is the hardware neutral point.  Lower values reduce
-#                     the luma level going into the ADC, which can recover
+#   --brightness N    Luma level at the ADC (0-255, default 129).
+#                     129 is the cx231xx hardware default.  Lower values
+#                     attenuate the signal going into the ADC, recovering
 #                     highlight headroom when the VCR output is running hot.
 #                     Use vhs_quality.sh --sample 120 to compare captures at
 #                     different values and choose the one that minimises
 #                     widespread_clip without crushing shadows.
+#
+#   --contrast N      Luma range compression (0-95, default 35).
+#                     If brightness is reduced, a small contrast increase may
+#                     be needed to maintain tonal separation.
+#
+#   --saturation N    Chroma richness (0-100, default 40).
+#                     Adjust if colours appear washed out or oversaturated.
+#
+#   --hue N           Chroma phase offset in tenths of a degree (-2000 to
+#                     +2000, default 0).  Adjust if vhs_quality.sh shows a
+#                     consistent U/V chroma bias.  Small steps (100) make
+#                     noticeable changes — adjust carefully.
+#
+#   --gamma N         Midtone response curve (100-300, default 140).
+#                     Affects shadow and highlight compression.  Leave at
+#                     default unless brightness/contrast alone cannot correct
+#                     shadow crush or highlight compression.
+#
+#   --sharpness N     Edge enhancement (0-70, default 5).
+#                     Default is already low which is correct for archival.
+#                     Do not increase unless content is unusually soft.
 #
 #   --output-dir DIR  Root directory under which the capture subdirectory is
 #                     created.  Defaults to ~/dv_captures (same as
 #                     capture_passthrough.sh) so captures land alongside DV
 #                     files automatically.  Created if it does not exist.
 #
-# The input type and brightness value are embedded in the output filename so
-# captures at different settings sort and compare without manual renaming.
+# Controls that differ from their hardware defaults are embedded in the output
+# filename so captures at different settings sort and compare without renaming.
 
 set -euo pipefail
 
@@ -92,9 +116,20 @@ fi
 AUDIO_DEV="hw:${AUDIO_CARD},0"
 
 # --- 3. Argument Parsing ---
-# Default V4L2 brightness: 128 is the hardware neutral point (no adjustment).
-# Valid range is 0-255; values below 128 attenuate the luma signal at the ADC.
-BRIGHTNESS=128
+# V4L2 control defaults match cx231xx hardware defaults exactly.
+# Controls set to their default are not applied (driver already has them)
+# and are omitted from the output filename to keep names concise.
+BRIGHTNESS=129   # range 0-255
+CONTRAST=35      # range 0-95
+SATURATION=40    # range 0-100
+HUE=0            # range -2000 to +2000 (tenths of a degree)
+GAMMA=140        # range 100-300
+SHARPNESS=5      # range 0-70
+
+# Track which controls were explicitly set on the command line so only
+# those are applied to the hardware and embedded in the filename.
+declare -A CTRL_SET=( [brightness]=0 [contrast]=0 [saturation]=0
+                      [hue]=0 [gamma]=0 [sharpness]=0 )
 
 # Default output root: matches capture_passthrough.sh convention.
 OUTPUT_DIR="${HOME}/dv_captures"
@@ -108,17 +143,45 @@ INPUT_LABEL=""
 SOURCE_ID=""
 EXTRA_DESC=""
 
+# ------------------------------------------------------------------------------
+# Helper: validate_int NAME VALUE MIN MAX
+# Checks that VALUE is an integer within [MIN, MAX].  Exits on failure.
+# Handles negative values (e.g. hue range -2000 to +2000).
+# ------------------------------------------------------------------------------
+validate_int() {
+    local name="$1" val="$2" min="$3" max="$4"
+    if [[ ! "$val" =~ ^-?[0-9]+$ ]] || (( val < min || val > max )); then
+        echo "Error: --${name} requires an integer in the range ${min} to ${max}."
+        exit 1
+    fi
+}
+
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         --brightness)
-            if [[ -z "${2:-}" ]] || [[ ! "${2}" =~ ^[0-9]+$ ]] \
-               || (( ${2} < 0 || ${2} > 255 )); then
-                echo "Error: --brightness requires an integer in the range 0-255."
-                exit 1
-            fi
-            BRIGHTNESS="$2"
-            shift 2
-            ;;
+            [[ -z "${2:-}" ]] && { echo "Error: --brightness requires a value."; exit 1; }
+            validate_int brightness "$2" 0 255
+            BRIGHTNESS="$2"; CTRL_SET[brightness]=1; shift 2 ;;
+        --contrast)
+            [[ -z "${2:-}" ]] && { echo "Error: --contrast requires a value."; exit 1; }
+            validate_int contrast "$2" 0 95
+            CONTRAST="$2"; CTRL_SET[contrast]=1; shift 2 ;;
+        --saturation)
+            [[ -z "${2:-}" ]] && { echo "Error: --saturation requires a value."; exit 1; }
+            validate_int saturation "$2" 0 100
+            SATURATION="$2"; CTRL_SET[saturation]=1; shift 2 ;;
+        --hue)
+            [[ -z "${2:-}" ]] && { echo "Error: --hue requires a value."; exit 1; }
+            validate_int hue "$2" -2000 2000
+            HUE="$2"; CTRL_SET[hue]=1; shift 2 ;;
+        --gamma)
+            [[ -z "${2:-}" ]] && { echo "Error: --gamma requires a value."; exit 1; }
+            validate_int gamma "$2" 100 300
+            GAMMA="$2"; CTRL_SET[gamma]=1; shift 2 ;;
+        --sharpness)
+            [[ -z "${2:-}" ]] && { echo "Error: --sharpness requires a value."; exit 1; }
+            validate_int sharpness "$2" 0 70
+            SHARPNESS="$2"; CTRL_SET[sharpness]=1; shift 2 ;;
         --output-dir)
             if [[ -z "${2:-}" ]]; then
                 echo "Error: --output-dir requires a directory path."
@@ -139,7 +202,7 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         -*)
             echo "Error: Unknown option: $1"
-            echo "Usage: $0 [--brightness N] [--output-dir DIR] [--svideo|--composite] <SOURCE_ID> [DESCRIPTION]"
+            echo "Usage: $0 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--gamma N] [--sharpness N] [--output-dir DIR] [--svideo|--composite] <SOURCE_ID> [DESCRIPTION]"
             exit 1
             ;;
         *)
@@ -176,8 +239,10 @@ fi
 
 echo "--------------------------------------------------------"
 echo "HAUPPAUGE CAPTURE SYSTEM"
-echo "Detected:   Video=$VIDEO_DEV | Audio=$AUDIO_DEV"
-echo "Brightness: $BRIGHTNESS (128=neutral, lower=attenuate)"
+echo "Detected:    Video=$VIDEO_DEV | Audio=$AUDIO_DEV"
+echo "Brightness:  $BRIGHTNESS (default 129) | Contrast:   $CONTRAST (default 35)"
+echo "Saturation:  $SATURATION (default 40)  | Hue:        $HUE (default 0)"
+echo "Gamma:       $GAMMA (default 140)      | Sharpness:  $SHARPNESS (default 5)"
 echo "Output root: $(realpath "$OUTPUT_DIR")"
 echo "--------------------------------------------------------"
 
@@ -265,11 +330,35 @@ DUR_LABEL="${DUR_INPUT}"
 # --- 7. Hardware Initialization ---
 v4l2-ctl -d "$VIDEO_DEV" -i "$INPUT_NUM" >/dev/null 2>&1   # Set selected input
 v4l2-ctl -d "$VIDEO_DEV" -s ntsc >/dev/null 2>&1            # Force NTSC standard
-# Set luma brightness/attenuation.  128 is the cx231xx neutral point; values
-# below 128 reduce the ADC input level, recovering headroom on hot VCR outputs.
-# The current value is reported in the banner and embedded in the filename.
-v4l2-ctl -d "$VIDEO_DEV" --set-ctrl=brightness="$BRIGHTNESS" 2>/dev/null || \
-    confirm_continue "brightness control not supported by this driver/device. Capture will proceed at the hardware default level; the requested attenuation will NOT be applied."
+
+# Apply each V4L2 control that was explicitly set on the command line.
+# Controls left at their hardware default are skipped — the driver already
+# has them set correctly and skipping avoids spurious "not supported" errors
+# on driver versions that expose a subset of controls.
+# The ctrl_ok helper returns 0 on success, calls confirm_continue on failure.
+apply_ctrl() {
+    local name="$1" val="$2"
+    v4l2-ctl -d "$VIDEO_DEV" --set-ctrl="${name}=${val}" 2>/dev/null || \
+        confirm_continue "${name} control not supported by this driver. Capture will proceed without this adjustment."
+}
+
+[[ "${CTRL_SET[brightness]}"  -eq 1 ]] && apply_ctrl brightness  "$BRIGHTNESS"
+[[ "${CTRL_SET[contrast]}"    -eq 1 ]] && apply_ctrl contrast    "$CONTRAST"
+[[ "${CTRL_SET[saturation]}"  -eq 1 ]] && apply_ctrl saturation  "$SATURATION"
+[[ "${CTRL_SET[hue]}"         -eq 1 ]] && apply_ctrl hue         "$HUE"
+[[ "${CTRL_SET[gamma]}"       -eq 1 ]] && apply_ctrl gamma       "$GAMMA"
+[[ "${CTRL_SET[sharpness]}"   -eq 1 ]] && apply_ctrl sharpness   "$SHARPNESS"
+
+# Build filename suffix from controls that differ from hardware defaults.
+# Format: _bBRIGHTNESS_cCONTRAST_sSATURATION_hHUE_gGAMMA_shSHARPNESS
+# Only non-default values are included to keep filenames concise.
+CTRL_SUFFIX=""
+[[ "$BRIGHTNESS" -ne 129  ]] && CTRL_SUFFIX+="_b${BRIGHTNESS}"
+[[ "$CONTRAST"   -ne 35   ]] && CTRL_SUFFIX+="_c${CONTRAST}"
+[[ "$SATURATION" -ne 40   ]] && CTRL_SUFFIX+="_s${SATURATION}"
+[[ "$HUE"        -ne 0    ]] && CTRL_SUFFIX+="_h${HUE}"
+[[ "$GAMMA"      -ne 140  ]] && CTRL_SUFFIX+="_g${GAMMA}"
+[[ "$SHARPNESS"  -ne 5    ]] && CTRL_SUFFIX+="_sh${SHARPNESS}"
 
 echo "Hardware initialised."
 echo ""
@@ -298,7 +387,7 @@ mkdir -p "$CAPTURE_DIR" || {
     echo "Error: could not create capture directory: $CAPTURE_DIR"
     exit 1
 }
-OUTPUT_FILE="${CAPTURE_DIR}/${BASE_NAME}_${INPUT_LABEL}_b${BRIGHTNESS}.mkv"
+OUTPUT_FILE="${CAPTURE_DIR}/${BASE_NAME}_${INPUT_LABEL}${CTRL_SUFFIX}.mkv"
 
 # --- 8. Action: Starting Combined Capture & Monitor ---
 # Using rawvideo for master archive and NUT pipe for live monitoring

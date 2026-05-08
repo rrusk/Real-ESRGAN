@@ -59,6 +59,28 @@
 # ==============================================================================
 set -euo pipefail
 
+# ==============================================================================
+# Dependency Preflight
+# Checked before main() so the script fails fast with a clear message rather
+# than mid-run. nproc is optional: without it the thread count falls back to 4.
+# ==============================================================================
+_MISSING=0
+for _cmd in ffmpeg ffprobe bc awk; do
+    if ! command -v "$_cmd" >/dev/null 2>&1; then
+        echo "[ERROR] Required command not found: $_cmd"
+        echo "        Install it and retry."
+        _MISSING=1
+    fi
+done
+if [[ "$_MISSING" -eq 1 ]]; then
+    exit 1
+fi
+
+if ! command -v nproc >/dev/null 2>&1; then
+    echo "[WARNING] nproc not found — thread count will default to 4."
+    echo "          Install coreutils to suppress this warning."
+fi
+
 main() {
 
 # --- 1. Argument Check ---
@@ -103,7 +125,10 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "                       full-resolution progressive frame (~30fps). Lower"
     echo "                       CPU cost and smaller output file."
     echo ""
-    echo "  --crf N              x264 quality level (default: 16 — near-transparent for SD)."
+    echo "  --threads N          libx264 encoder thread count (default: half of logical CPU
+                       cores, minimum 4, matching video_upscale_pipeline.py).
+                       Use --threads 0 to let libx264 auto-detect (all cores).
+  --crf N              x264 quality level (default: 16 — near-transparent for SD)."
     echo "                       Lower = higher quality and larger file."
     echo "                       14   perceptually lossless for most SD sources."
     echo "                       16   default; suitable for archival watchable copies."
@@ -179,6 +204,7 @@ SHARPEN=false   # opt-in; profiles already include unsharp=3:3:0.15 (except halo
 DAR_OVERRIDE=""
 BWDIF_MODE=1    # default: field-rate output (~60fps); --mode0 sets this to 0 (~30fps)
 CRF_VALUE=16    # default: near-transparent for SD; lower (e.g. 14) for maximum archival quality
+THREADS=""      # default: auto (half logical cores, min 4); override with --threads N
 FORCE_AAC=false
 TEST_MODE=false
 FORCE_60FPS=false
@@ -187,6 +213,7 @@ _NEXT_IS_PROFILE=false
 _NEXT_IS_DAR=false
 _NEXT_IS_CRF=false
 _NEXT_IS_SCALE=false
+_NEXT_IS_THREADS=false
 
 for arg in "$@"; do
     if [[ "$_NEXT_IS_PROFILE" == true ]]; then
@@ -205,6 +232,13 @@ for arg in "$@"; do
         fi
         SCALE_FACTOR="$arg"
         _NEXT_IS_SCALE=false
+    elif [[ "$_NEXT_IS_THREADS" == true ]]; then
+        if ! [[ "$arg" =~ ^[0-9]+$ ]]; then
+            echo "Error: --threads requires a non-negative integer (e.g. --threads 8, or --threads 0 for auto)."
+            exit 1
+        fi
+        THREADS="$arg"
+        _NEXT_IS_THREADS=false
     elif [[ "$arg" == "--profile" ]]; then
         _NEXT_IS_PROFILE=true
     elif [[ "$arg" == "--dar" ]]; then
@@ -213,6 +247,8 @@ for arg in "$@"; do
         _NEXT_IS_CRF=true
     elif [[ "$arg" == "--scale" ]]; then
         _NEXT_IS_SCALE=true
+    elif [[ "$arg" == "--threads" ]]; then
+        _NEXT_IS_THREADS=true
     elif [[ "$arg" =~ ^[0-9]+$ ]]; then
         MASK_PIXELS="$arg"
         MASK_EXPLICITLY_SET=true
@@ -233,7 +269,27 @@ for arg in "$@"; do
     fi
 done
 
-# --- 3. Validate CRF ---
+# --- 3. Thread Count Resolution ---
+# Mirrors video_upscale_pipeline.py: default to half of logical CPU cores,
+# minimum 4. --threads 0 passes through to libx264 as auto-detect (all cores).
+# --threads N overrides the auto-detected value for concurrent-run scenarios.
+if [[ -n "$THREADS" ]]; then
+    # User override: 0 means libx264 auto (all cores), any N > 0 is explicit.
+    THREADS_CMD="$THREADS"
+    if [[ "$THREADS" -eq 0 ]]; then
+        THREADS_LABEL="auto (libx264 default — all cores; --threads 0)"
+    else
+        THREADS_LABEL="$THREADS (--threads override)"
+    fi
+else
+    _cpu_count=$(nproc 2>/dev/null || echo 4)
+    THREADS_CMD=$(( _cpu_count / 2 ))
+    (( THREADS_CMD < 4 )) && THREADS_CMD=4
+    THREADS_LABEL="${THREADS_CMD} (auto: half of ${_cpu_count} logical cores, min 4)"
+fi
+echo "[INFO] libx264 threads: $THREADS_LABEL"
+
+# --- 4. Validate CRF ---
 # Catches non-integer values (e.g. '--crf fast') before ffmpeg sees them,
 # and warns when the value seems unreasonable for a kept archival output.
 # Hard error above 51 (x264 maximum). Warnings are informational only.
@@ -980,6 +1036,7 @@ echo "Upscale:       $([ "$SCALE_FACTOR" -gt 1 ] && echo "${SCALE_FACTOR}x lancz
 echo "Sharpen:       $SHARPEN_LABEL"
 echo "DAR:           $DAR_LABEL"
 echo "CRF:           $CRF_VALUE"
+echo "Threads:       $THREADS_LABEL"
 echo "Audio:         $AUDIO_PLAN"
 if [[ -n "$FFLAGS" ]]; then
     echo "PTS repair:    enabled (+genpts — broken/missing stream timestamps)"
@@ -1017,7 +1074,7 @@ echo ""
 ffmpeg -y $FFLAGS $LIMIT_CMD -i "$SOURCE_INPUT" \
     -vf "$FILTER_CHAIN" \
     $DAR_CMD \
-    -c:v libx264 -threads 0 -crf "$CRF_VALUE" -preset slower \
+    -c:v libx264 -threads "$THREADS_CMD" -crf "$CRF_VALUE" -preset slower \
     -pix_fmt yuv420p \
     -movflags +faststart \
     $AUDIO_CMD \

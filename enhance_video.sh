@@ -83,6 +83,14 @@ fi
 
 main() {
 
+# ==============================================================================
+# Configuration
+# ==============================================================================
+# Default output root. Use a symlink to point this at actual storage:
+#   ln -s /path/to/actual/storage ~/video_enhance
+# Override at runtime with: -o /path/to/output
+ENHANCE_ROOT="${HOME}/video_enhance"
+
 # --- 1. Argument Check ---
 if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "Usage: $0 <source_video> [mask_pixels] [options]"
@@ -125,10 +133,13 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "                       full-resolution progressive frame (~30fps). Lower"
     echo "                       CPU cost and smaller output file."
     echo ""
-    echo "  --threads N          libx264 encoder thread count (default: half of logical CPU
-                       cores, minimum 4, matching video_upscale_pipeline.py).
-                       Use --threads 0 to let libx264 auto-detect (all cores).
-  --crf N              x264 quality level (default: 16 — near-transparent for SD)."
+    echo "  --threads N          libx264 encoder thread count (default: half of logical CPU"
+    echo "                       cores, minimum 4, matching video_upscale_pipeline.py)."
+    echo "                       Use --threads 0 to let libx264 auto-detect (all cores)."
+    echo "  --output-dir DIR     Output directory (default: ~/video_enhance)."
+    echo "                       Created automatically if it does not exist."
+    echo "                       ~/video_enhance may be a symlink to another storage device."
+    echo "  --crf N              x264 quality level (default: 16 — near-transparent for SD)."
     echo "                       Lower = higher quality and larger file."
     echo "                       14   perceptually lossless for most SD sources."
     echo "                       16   default; suitable for archival watchable copies."
@@ -208,12 +219,14 @@ THREADS=""      # default: auto (half logical cores, min 4); override with --thr
 FORCE_AAC=false
 TEST_MODE=false
 FORCE_60FPS=false
+OUTPUT_DIR_OVERRIDE=""  # default: ~/video_enhance; override with --output-dir PATH
 
 _NEXT_IS_PROFILE=false
 _NEXT_IS_DAR=false
 _NEXT_IS_CRF=false
 _NEXT_IS_SCALE=false
 _NEXT_IS_THREADS=false
+_NEXT_IS_OUTPUT_DIR=false
 
 for arg in "$@"; do
     if [[ "$_NEXT_IS_PROFILE" == true ]]; then
@@ -239,6 +252,9 @@ for arg in "$@"; do
         fi
         THREADS="$arg"
         _NEXT_IS_THREADS=false
+    elif [[ "$_NEXT_IS_OUTPUT_DIR" == true ]]; then
+        OUTPUT_DIR_OVERRIDE="$arg"
+        _NEXT_IS_OUTPUT_DIR=false
     elif [[ "$arg" == "--profile" ]]; then
         _NEXT_IS_PROFILE=true
     elif [[ "$arg" == "--dar" ]]; then
@@ -249,6 +265,8 @@ for arg in "$@"; do
         _NEXT_IS_SCALE=true
     elif [[ "$arg" == "--threads" ]]; then
         _NEXT_IS_THREADS=true
+    elif [[ "$arg" == "--output-dir" ]]; then
+        _NEXT_IS_OUTPUT_DIR=true
     elif [[ "$arg" =~ ^[0-9]+$ ]]; then
         MASK_PIXELS="$arg"
         MASK_EXPLICITLY_SET=true
@@ -963,8 +981,38 @@ fi
 BASE_NAME=$(basename "$SOURCE_INPUT")
 FILE_STEM="${BASE_NAME%.*}"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-OUTPUT_DIR="outputs"
-mkdir -p "$OUTPUT_DIR"
+
+# Resolve output directory: --output-dir overrides ENHANCE_ROOT.
+# ~/video_enhance may be a symlink to another storage device — validated the
+# same way capture_passthrough.sh validates CAPTURE_ROOT.
+if [[ -n "$OUTPUT_DIR_OVERRIDE" ]]; then
+    OUTPUT_DIR="$OUTPUT_DIR_OVERRIDE"
+else
+    OUTPUT_DIR="$ENHANCE_ROOT"
+fi
+
+if [ ! -e "$OUTPUT_DIR" ]; then
+    if [ -L "$OUTPUT_DIR" ]; then
+        echo "[ERROR] Output directory is a broken symlink: $OUTPUT_DIR"
+        echo "        Fix with: ln -sf /path/to/actual/storage $OUTPUT_DIR"
+        exit 1
+    fi
+    mkdir -p "$OUTPUT_DIR" || {
+        echo "[ERROR] Failed to create output directory: $OUTPUT_DIR"
+        exit 1
+    }
+    echo "[INFO] Created output directory: $OUTPUT_DIR"
+fi
+
+if [ ! -d "$OUTPUT_DIR" ]; then
+    echo "[ERROR] Output path exists but is not a directory: $OUTPUT_DIR"
+    exit 1
+fi
+
+if [ ! -w "$OUTPUT_DIR" ]; then
+    echo "[ERROR] Output directory is not writable: $OUTPUT_DIR"
+    exit 1
+fi
 
 if [[ "$IS_INTERLACED" == true ]]; then
     DEINT_LABEL="_$([ "$BWDIF_MODE" -eq 0 ] && echo "30fps" || echo "60fps")"
@@ -1019,6 +1067,7 @@ echo "Source File:   $SOURCE_INPUT"
 echo "  Codec:       $SOURCE_CODEC"
 echo "  Dimensions:  ${SRC_WIDTH}x${SRC_HEIGHT}  |  Pixel fmt: $PIX_FMT"
 echo "  Duration:    ${DURATION_SEC}s"
+echo "Output Dir:    $OUTPUT_DIR"
 echo "Output File:   $OUTPUT_FILE"
 echo "-----------------------------------------"
 if [[ "$IS_INTERLACED" == true ]]; then

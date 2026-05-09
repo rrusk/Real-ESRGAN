@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # vhs_quality.sh
-# Usage: ./vhs_quality.sh [--sample SECONDS] [--no-histogram] [--histogram-only] <session_dir_a> [session_dir_b]
+# Usage: ./vhs_quality.sh [--sample SECONDS] [--no-histogram] [--histogram-only] [--correction-cmd] <session_dir_a> [session_dir_b]
 #
 # Each argument is a capture session directory produced by capture_passthrough.sh
 # or capture_tape.sh.  The directory must contain exactly one .dv file and
@@ -60,9 +60,10 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Arguments
 # ------------------------------------------------------------------------------
-SAMPLE_DURATION=""   # empty = full file; set to seconds string if --sample given
-RUN_HISTOGRAM=1      # 1 = run by default; 0 = skip (--no-histogram)
-HISTOGRAM_ONLY=0     # 1 = skip Steps 1-6, run only integrity check + histogram
+SAMPLE_DURATION=""      # empty = full file; set to seconds string if --sample given
+RUN_HISTOGRAM=1         # 1 = run by default; 0 = skip (--no-histogram)
+HISTOGRAM_ONLY=0        # 1 = skip Steps 1-6, run only integrity check + histogram
+SHOW_CORRECTION_CMD=0   # 1 = emit ffmpeg correction command (--correction-cmd)
 
 usage() {
     cat <<EOF
@@ -86,6 +87,12 @@ Options:
   --histogram-only    Run only the integrity check and pixel histogram,
                       skipping all signalstats processing (Steps 1-6).
                       Approximately half the runtime of a full run.
+
+  --correction-cmd    Print an ffmpeg highlight rolloff command in the report.
+                      WARNING: only useful when the luma histogram shows a hard
+                      ADC spike at Y=255.  Applying the rolloff to a smooth bright
+                      signal compresses real information and may do more harm than
+                      good.  Consult the histogram before using the output command.
 
   -h, --help          Show this help and exit.
 
@@ -115,6 +122,10 @@ while [[ "$#" -gt 0 ]]; do
         --histogram-only)
             RUN_HISTOGRAM=1
             HISTOGRAM_ONLY=1
+            shift
+            ;;
+        --correction-cmd)
+            SHOW_CORRECTION_CMD=1
             shift
             ;;
         -h|--help)
@@ -1325,23 +1336,23 @@ printf "%-42s %10s\n" "------" "-----"
 printf "%-42s %10s\n" "Mean brightness        (YAVG)"        "$YAA"
 printf "%-42s %10s\n" "Mean peak luma         (YMAX mean)"   "$YMA"
 printf "%-42s %10s\n" "Widespread clip frames (YHIGH>=${CLIP_YHIGH_THRESHOLD})" "$WCLA"
-printf "%-42s %10s\n" "True clip frames       (YMAX=255)"    "$TCLA"
-printf "%-42s %10s\n" "Luma clip frames       (YMIN<=16 or YMAX=255)" "$CLA"
+printf "%-42s %10s\n" "Hard clip frames       (YMAX=255)"    "$TCLA"
 printf "%-42s %10s\n" "Highlight texture var  (YHIGH>=${HIGHLIGHT_YHIGH_THRESHOLD}, n=${HLNA})" "$HLVA"
 printf "%-42s %10s\n" "Dropout frames         (YDIF>${DROPOUT_YDIF_THRESHOLD})" "$DOA"
 printf "\n"
 
 # --- YMAX distribution ---
 printf "YMAX Distribution (frames per luma bucket)\n"
-printf "  DV/studio-swing: black=16, nominal white=235, super-white=236-254,\n"
-printf "  true clip=255.  Frames in the nominal-high bucket have headroom;\n"
-printf "  frames at true clip do not.  Super-white is recoverable in post.\n"
+printf "  Hard clip=255 (ADC ceiling, information lost); near-white=236-254\n"
+printf "  (valid displayable signal); mid-high and below have full headroom.\n"
+printf "  A spike at 255 with near-zero neighbours at 253-254 indicates ADC\n"
+printf "  clipping.  A smooth rolloff to 255 is genuine bright signal.\n"
 printf "\n"
 printf "%-42s %10s\n" "Bucket" "Frames"
 printf "%-42s %10s\n" "------" "------"
-printf "%-42s %10s\n" "  True clip   (YMAX = 255)"          "$YMTCA"
-printf "%-42s %10s\n" "  Super-white (236 <= YMAX < 255)"   "$YMSWA"
-printf "%-42s %10s\n" "  Nominal high (200 <= YMAX <= 235)" "$YMHA"
+printf "%-42s %10s\n" "  Hard clip   (YMAX = 255)"          "$YMTCA"
+printf "%-42s %10s\n" "  Near-white  (236 <= YMAX < 255)"   "$YMSWA"
+printf "%-42s %10s\n" "  High        (200 <= YMAX <= 235)"  "$YMHA"
 printf "%-42s %10s\n" "  Mid-high    (175 <= YMAX < 200)"   "$YMMHA"
 printf "%-42s %10s\n" "  Mid-low     (128 <= YMAX < 175)"   "$YMMLA"
 printf "%-42s %10s\n" "  Low         (YMAX < 128)"          "$YMLA"
@@ -1392,53 +1403,21 @@ printf "\n"
 
 # --- Post-processing ---
 printf "Post-Processing Guidance\n"
+printf "  Widespread clip frames (YHIGH>=${CLIP_YHIGH_THRESHOLD}): %s\n" "$WCLA"
+printf "  Hard clip frames (YMAX=255): %s\n" "$TCLA"
 printf "\n"
-printf "%-42s %10s\n" "  Widespread clip frames (YHIGH>=${CLIP_YHIGH_THRESHOLD})" "$WCLA"
-printf "%-42s %10s\n" "  Linear scale to midpoint (fallback)"   "$SCLA"
-printf "\n"
-_emit_cmd "Capture:" "$A" "$KNEA" "$SCLA"
-
-# --- JVC headroom advisory ---
-# The JVC HR-S2911U S-video output runs approximately 9-10 luma units hotter
-# than the Sony SLV-N60 composite output on the same tape.  If this capture
-# was made with the Sony and mean_yavg is low enough that absorbing a ~10-unit
-# boost would still leave the signal well clear of widespread clipping, it is
-# worth also capturing with the JVC to compare.  The threshold of 120 leaves
-# ~10 units before reaching the 128-132 target range ceiling.  The JVC may
-# offer better S-VHS head alignment on some tapes despite the level difference.
-JVC_HEADROOM_THRESHOLD=120
-if awk -v yavg="$YAA" -v thresh="$JVC_HEADROOM_THRESHOLD" \
-       'BEGIN { exit !(yavg+0 <= thresh) }'; then
+if [ "$SHOW_CORRECTION_CMD" -eq 1 ]; then
+    printf "Post-Processing Correction Command\n"
+    printf "  WARNING: only useful when the luma histogram shows a hard ADC spike\n"
+    printf "  at Y=255 with near-zero neighbours at 253-254.  Applying this to a\n"
+    printf "  smooth bright signal compresses real information — verify the\n"
+    printf "  histogram before using this command.\n"
     printf "\n"
-    printf "JVC Headroom Advisory\n"
-    printf "  Mean brightness (YAVG=%.3f) is at or below %.0f.\n" \
-        "$YAA" "$JVC_HEADROOM_THRESHOLD"
-    printf "  The JVC HR-S2911U S-video output typically runs ~10 luma units\n"
-    printf "  hotter than the Sony composite output on the same tape.  With\n"
-    printf "  this level of headroom the JVC may produce an acceptable signal\n"
-    printf "  without significant additional clipping, and its S-VHS heads may\n"
-    printf "  offer better tape contact on some recordings.\n"
-    printf "  Recommendation: capture with JVC S-video → TRV330 and compare\n"
-    printf "  using: vhs_quality.sh --histogram <sony.dv> <jvc.dv>\n"
-elif awk -v yavg="$YAA" -v wclip="$WCLA" -v frames="$FA" \
-         'BEGIN { exit !(yavg+0 >= 128 && yavg+0 <= 132 && wclip+0/frames+0 < 0.15) }'; then
+    printf "  Linear scale to midpoint (fallback): %s\n" "$SCLA"
     printf "\n"
-    printf "JVC Headroom Advisory\n"
-    printf "  Mean brightness is well-controlled (YAVG=%.3f) and widespread\n" \
-        "$YAA"
-    printf "  clipping is modest (%.1f%% of frames).  The JVC boost of ~10\n" \
-        "$(awk -v w="$WCLA" -v f="$FA" 'BEGIN{printf "%.1f", 100*w/f}')"
-    printf "  luma units would push YAVG to ~%.0f, likely increasing clipping.\n" \
-        "$(awk -v y="$YAA" 'BEGIN{printf "%.0f", y+10}')"
-    printf "  The Sony capture is well-optimised; JVC comparison is optional.\n"
-else
-    printf "\n"
-    printf "JVC Headroom Advisory\n"
-    printf "  Mean brightness (YAVG=%.3f) or widespread clip rate suggests\n" \
-        "$YAA"
-    printf "  the JVC S-video boost of ~10 luma units would increase clipping\n"
-    printf "  significantly.  The Sony capture is likely the better choice.\n"
+    _emit_cmd "Capture:" "$A" "$KNEA" "$SCLA"
 fi
+
 printf "========================================\n"
 } > "$W/report.txt"
 
@@ -1510,10 +1489,7 @@ printf "%-42s %8s %8s %6s\n" \
     "Dropout frames         (YDIF>${DROPOUT_YDIF_THRESHOLD})" \
     "$DOA" "$DOB" "$W_DROP"
 printf "%-42s %8s %8s %6s\n" \
-    "Luma clip frames       (YMIN<=16 or YMAX=255)" \
-    "$CLA" "$CLB" "$W_CLIP"
-printf "%-42s %8s %8s %6s\n" \
-    "True clip frames       (YMAX=255)" \
+    "Hard clip frames       (YMAX=255)" \
     "$TCLA" "$TCLB" "$W_TCLIP"
 printf "%-42s %8s %8s %6s\n" \
     "Widespread clip frames (YHIGH>=${CLIP_YHIGH_THRESHOLD})" \
@@ -1529,20 +1505,21 @@ printf "%-42s %8s %8s %6s\n" \
     "$HLVA" "$HLVB" "$W_HLV"
 printf "\n"
 printf "YMAX Distribution (frames per luma bucket)\n"
-printf "  DV studio-swing: black=16, nominal white=235, super-white=236-254,\n"
-printf "  true clip=255.  Super-white is valid recoverable signal; true clip\n"
-printf "  at 255 is the only value where information is genuinely lost.\n"
+printf "  Hard clip=255 (ADC ceiling, information lost); near-white=236-254\n"
+printf "  (valid displayable signal); mid-high and below have full headroom.\n"
+printf "  A spike at 255 with near-zero neighbours at 253-254 indicates ADC\n"
+printf "  clipping.  A smooth rolloff to 255 is genuine bright signal.\n"
 printf "\n"
 printf "%-42s %8s %8s %6s\n" "Bucket" "A" "B" "Better"
 printf "%-42s %8s %8s %6s\n" "------" "-" "-" "------"
 printf "%-42s %8s %8s %6s\n" \
-    "  True clip   (YMAX = 255)" \
+    "  Hard clip   (YMAX = 255)" \
     "$YMTCA" "$YMTCB" "$W_YMTC"
 printf "%-42s %8s %8s %6s\n" \
-    "  Super-white (236 <= YMAX < 255)" \
+    "  Near-white  (236 <= YMAX < 255)" \
     "$YMSWA" "$YMSWB" "$W_YMSW"
 printf "%-42s %8s %8s %6s\n" \
-    "  Nominal high (200 <= YMAX <= 235)" \
+    "  High        (200 <= YMAX <= 235)" \
     "$YMHA" "$YMHB" ""
 printf "%-42s %8s %8s %6s\n" \
     "  Mid-high    (175 <= YMAX < 200)" \
@@ -1602,23 +1579,29 @@ printf "%-42s %8s %8s %6s\n" \
     "$YSNA" "$YSNB" "$W_YSNA"
 printf "\n"
 printf "Post-Processing Guidance\n"
-printf "  Highlight rolloff curve to soften clipping on affected captures.\n"
-printf "  Leaves shadows and midtones untouched; compresses only the upper\n"
-printf "  luma range.  The knee is derived from the YHIGH distribution on\n"
-printf "  clipping frames.  Already-clipped pixels (at 255) cannot be\n"
-printf "  recovered - this improves the transition into clipped regions.\n"
-printf "\n"
 printf "%-42s %8s %8s\n" "Metric" "A" "B"
 printf "%-42s %8s %8s\n" "------" "-" "-"
 printf "%-42s %8s %8s\n" \
     "  Widespread clip frames (YHIGH>=${CLIP_YHIGH_THRESHOLD})" \
     "$WCLA" "$WCLB"
 printf "%-42s %8s %8s\n" \
-    "  Linear scale to midpoint (fallback)" \
-    "$SCLA" "$SCLB"
+    "  Hard clip frames (YMAX=255)" \
+    "$TCLA" "$TCLB"
 printf "\n"
-_emit_cmd "Capture A:" "$A" "$KNEA" "$SCLA"
-_emit_cmd "Capture B:" "$B" "$KNEB" "$SCLB"
+if [ "$SHOW_CORRECTION_CMD" -eq 1 ]; then
+    printf "Post-Processing Correction Command\n"
+    printf "  WARNING: only useful when the luma histogram shows a hard ADC spike\n"
+    printf "  at Y=255 with near-zero neighbours at 253-254.  Applying this to a\n"
+    printf "  smooth bright signal compresses real information — verify the\n"
+    printf "  histogram before using this command.\n"
+    printf "\n"
+    printf "%-42s %8s %8s\n" \
+        "  Linear scale to midpoint (fallback)" \
+        "$SCLA" "$SCLB"
+    printf "\n"
+    _emit_cmd "Capture A:" "$A" "$KNEA" "$SCLA"
+    _emit_cmd "Capture B:" "$B" "$KNEB" "$SCLB"
+fi
 printf "  Temporal luma noise (YDIF): mean absolute luma change frame-to-\n"
 printf "  frame. Lower = less noise and fewer dropouts from the VCR.\n"
 printf "\n"
@@ -1647,22 +1630,19 @@ printf "\n"
 printf "  Dropout frames: single-frame YDIF spikes above threshold.\n"
 printf "  See dropouts_a.txt / dropouts_b.txt for frame-level detail.\n"
 printf "\n"
-printf "  Luma clip: frames where any pixel hits true clip (YMAX=255) or\n"
-printf "  black crush (YMIN<=16).  In DV studio-swing, values 236-254 are\n"
-printf "  super-white - valid signal above nominal white, not clipping.\n"
-printf "  Only YMAX=255 represents genuine information loss.\n"
-printf "\n"
-printf "  True clip frames (YMAX=255): frames where at least one pixel is\n"
-printf "  fully clipped with no recoverable detail.  This is the meaningful\n"
-printf "  clip count; super-white frames (236-254) are not counted here.\n"
+printf "  Hard clip frames (YMAX=255): frames where at least one pixel has\n"
+printf "  hit the ADC ceiling.  Check the luma histogram: a spike at 255\n"
+printf "  with near-zero neighbours indicates genuine information loss.\n"
+printf "  A smooth rolloff to 255 means the signal is bright but intact.\n"
 printf "\n"
 printf "  Widespread clip (YHIGH>=%d): frames where the 75th-percentile\n" \
     "$CLIP_YHIGH_THRESHOLD"
-printf "  luma is at or above nominal white (235) - meaning at least 25%%\n"
-printf "  of the frame is in the super-white or clipped region.  This\n"
-printf "  distinguishes a dance floor blown out by strong reflection from\n"
-printf "  an isolated specular on a costume.  These frames benefit most\n"
-printf "  from the highlight rolloff correction.\n"
+printf "  luma exceeds this threshold — at least 25%% of the frame is very\n"
+printf "  bright.  Used to compare signal path headroom between two VCRs.\n"
+printf "  A large difference between A-only and B-only counts identifies\n"
+printf "  the deck with less headroom.  Does NOT indicate the signal needs\n"
+printf "  post-processing correction unless the histogram confirms a hard\n"
+printf "  ADC spike at 255.\n"
 printf "  Adjust CLIP_YHIGH_THRESHOLD in the script if needed.\n"
 printf "\n"
 printf "  Vertical line repeat (VREP): signalstats measure of how much\n"
@@ -1707,17 +1687,17 @@ printf "  comparison uncontaminated by clipping artefacts.\n"
 printf "\n"
 printf "  Post-processing curves: the rolloff uses lutyuv=y (ffmpeg 4.x\n"
 printf "  compatible) to compress luma above the knee, leaving everything\n"
-printf "  below the knee unchanged.  The full knee-255 range is compressed\n"
-printf "  into knee-235, so that 255 maps to broadcast white (235) and all\n"
-printf "  gradation above the knee is preserved rather than clipped.  The\n"
+printf "  below the knee unchanged.  Only apply when the luma histogram\n"
+printf "  confirms a hard ADC spike at Y=255; applying it to a smooth\n"
+printf "  bright signal compresses real information unnecessarily.  The\n"
 printf "  knee is derived from the 10th-percentile of the YHIGH histogram\n"
 printf "  on clipping frames.  If no widespread clipping is detected a\n"
 printf "  simpler linear scale is suggested instead.\n"
 printf "\n"
 printf "  YMAX distribution: frame counts bucketed by per-frame peak luma.\n"
-printf "  DV studio-swing uses black=16, nominal white=235, super-white\n"
-printf "  236-254, true clip=255.  Super-white is recoverable with the\n"
-printf "  highlight rolloff command; true clip at 255 is not.\n"
+printf "  Hard clip at 255 is the only value representing information loss.\n"
+printf "  Values 236-254 and below are valid displayable signal; they do\n"
+printf "  not require correction.\n"
 printf "\n"
 printf "  YAVG distribution: frame counts bucketed by per-frame mean luma.\n"
 printf "  Compares where the overall brightness mass sits. If the bright\n"

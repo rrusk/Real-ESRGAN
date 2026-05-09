@@ -306,7 +306,9 @@ check_integrity() {
     # --- Primary: dvgrab log ---
     if [[ -n "$DVGRAB_LOG" && -f "$DVGRAB_LOG" ]]; then
         local DROP_COUNT
-        DROP_COUNT=$(grep -c "damaged frame" "$DVGRAB_LOG" 2>/dev/null || echo "0")
+        # Sum all lines from grep -c (handles multi-segment logs), strip CR.
+        DROP_COUNT=$(grep -c "damaged frame" "$DVGRAB_LOG" 2>/dev/null \
+            | tr -d '\r' | awk '{s+=$1} END{print s+0}')
         if [ "$DROP_COUNT" -eq 0 ]; then
             echo "  ${LABEL}: OK — no damaged frames in dvgrab log"
         else

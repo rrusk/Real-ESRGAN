@@ -1080,7 +1080,7 @@ else
     echo "Deinterlace:   not needed (source is progressive)"
 fi
 echo "Bottom Mask:   ${MASK_PIXELS}px  ($MASK_SOURCE)"
-echo "Profile:       $PROFILE ($FPS_LABEL variant)  —  ${PROFILE_DESCRIPTIONS[$PROFILE]}"
+echo "Profile:       $PROFILE ($FPS_LABEL)  —  ${PROFILE_DESCRIPTIONS[$PROFILE]}"
 echo "Upscale:       $([ "$SCALE_FACTOR" -gt 1 ] && echo "${SCALE_FACTOR}x lanczos" || echo "none (--scale 1)")"
 echo "Sharpen:       $SHARPEN_LABEL"
 echo "DAR:           $DAR_LABEL"

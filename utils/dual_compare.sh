@@ -1396,20 +1396,37 @@ local function seek_absolute_both(secs)
     end
 end
 
--- Seek both by delta seconds
+-- Seek both by delta seconds.
+-- Only the left instance drives this to avoid double-seeking when a key is
+-- pressed in the right window (same pattern as nudge/coarse/waypoint).
+-- Uses seek_absolute_both() so alignment drift cannot accumulate: the left
+-- window's current position is the single reference, and both windows are
+-- sent explicit absolute targets rather than independent relative deltas.
 local function seek_both(delta)
-    mp.commandv("seek", tostring(delta), "relative", "exact")
-    send_peer(string.format('{"command":["seek",%d,"relative","exact"]}', delta))
+    if side == "left" then
+        local pos = mp.get_property_number("time-pos") or 0
+        seek_absolute_both(pos + delta)
+    else
+        send_peer(string.format(
+            '{"command":["script-message","dual-seek","%.3f"]}', delta))
+    end
 end
 
--- Frame step both
+-- Frame step both.
+-- Only the left instance drives this to avoid double-stepping when a key is
+-- pressed in the right window (same pattern as seek_both/nudge/coarse).
 local function frame_step_both(dir)
-    if dir > 0 then
-        mp.commandv("frame-step")
-        send_peer('{"command":["frame-step"]}')
+    if side == "left" then
+        if dir > 0 then
+            mp.commandv("frame-step")
+            send_peer('{"command":["frame-step"]}')
+        else
+            mp.commandv("frame-back-step")
+            send_peer('{"command":["frame-back-step"]}')
+        end
     else
-        mp.commandv("frame-back-step")
-        send_peer('{"command":["frame-back-step"]}')
+        send_peer(string.format(
+            '{"command":["script-message","dual-frame-step","%d"]}', dir))
     end
 end
 
@@ -1580,6 +1597,16 @@ end)
 
 mp.register_script_message("dual-wp-prev", function()
     if side == "left" then goto_waypoint(wp_index - 1) end
+end)
+
+-- Seek forwarding: right instance forwards to left instance
+mp.register_script_message("dual-seek", function(delta)
+    if side == "left" then seek_both(tonumber(delta)) end
+end)
+
+-- Frame step forwarding: right instance forwards to left instance
+mp.register_script_message("dual-frame-step", function(dir)
+    if side == "left" then frame_step_both(tonumber(dir)) end
 end)
 
 -- Nudge forwarding: right instance forwards to left instance

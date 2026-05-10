@@ -180,9 +180,15 @@ resolve_session() {
             ;;
         1)  ;;
         *)
-            echo "[WARN]  Capture $LABEL: ${#dv_files[@]} .dv files found in $DIR" >&2
-            echo "        This should not happen for VCR sessions (VCR is never paused)." >&2
-            echo "        Proceeding with first file: ${dv_files[0]}" >&2
+            echo "[ERROR] Capture $LABEL: ${#dv_files[@]} .dv files found in $DIR" >&2
+            echo "        Only one .dv file is expected per session directory." >&2
+            echo "        If you trimmed the capture, remove the untrimmed original first." >&2
+            echo "        Files found:" >&2
+            for f in "${dv_files[@]}"; do echo "          $f" >&2; done
+            # Signal error via stdout token: exit 1 inside process
+            # substitution may not propagate to the parent shell.
+            printf "ERROR\tERROR\n"
+            exit 1
             ;;
     esac
 
@@ -203,10 +209,12 @@ resolve_session() {
 
 # Resolve session directories into .dv paths and dvgrab log paths.
 { read -r A DVGRAB_LOG_A; } < <(resolve_session "$1" "A")
+[ "$A" = "ERROR" ] && exit 1
 B=""
 DVGRAB_LOG_B=""
 if [ "$#" -ge 2 ]; then
     { read -r B DVGRAB_LOG_B; } < <(resolve_session "$2" "B")
+    [ "$B" = "ERROR" ] && exit 1
 fi
 
 # SINGLE_MODE=1 when only one capture is provided.  Steps that require two
@@ -236,6 +244,9 @@ else
     W="${A_SHORT}_vs_${B_SHORT}_quality_${TIMESTAMP}"
 fi
 mkdir -p "$W"
+# Remove the output directory on unexpected exit if it is still empty.
+# Prevents leaving behind an empty directory when the script aborts early.
+trap '[ -d "$W" ] && [ -z "$(ls -A "$W")" ] && rmdir "$W" && echo "[INFO] Removed empty output directory: $W" >&2' EXIT
 
 # ------------------------------------------------------------------------------
 # Tuning parameters
@@ -1322,6 +1333,13 @@ if [ -n "$SAMPLE_DURATION" ]; then
     printf "\n"
 fi
 printf "  Frames analysed : %s\n" "$FA"
+printf "  Duration        : %s\n" "$(awk -v f="$FA" 'BEGIN {
+    total = f / 29.97
+    h = int(total / 3600)
+    m = int((total % 3600) / 60)
+    s = total % 60
+    printf "%dh%02dm%04.1fs", h, m, s
+}')" 
 if [ "$INTEGRITY_A_OK" -eq 1 ]; then
     printf "  *** WARNING: dropped frames detected — capture may be incomplete ***\n"
 fi
@@ -1445,7 +1463,10 @@ printf "  Audio peak B    : %ss\n"   "$PEAK_B"
 printf "  Alignment offset: %d frames (%.3fs)\n" \
     "$OFFSET_FRAMES" \
     "$(awk -v f="$OFFSET_FRAMES" 'BEGIN {printf "%.3f", f/29.97}')"
-printf "  Aligned frames  : A=%s  B=%s\n" "$FA" "$FB"
+printf "  Aligned frames  : A=%s (%s)  B=%s (%s)\n" "$FA" \
+    "$(awk -v f="$FA" 'BEGIN { t=f/29.97; h=int(t/3600); m=int((t%3600)/60); s=t%60; printf "%dh%02dm%04.1fs",h,m,s }')" \
+    "$FB" \
+    "$(awk -v f="$FB" 'BEGIN { t=f/29.97; h=int(t/3600); m=int((t%3600)/60); s=t%60; printf "%dh%02dm%04.1fs",h,m,s }')"
 if [ "${INTEGRITY_A_OK:-0}" -eq 1 ]; then
     printf "  *** WARNING: Capture A has dropped frames — capture may be incomplete ***\n"
 fi

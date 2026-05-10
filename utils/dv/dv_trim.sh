@@ -7,8 +7,10 @@
 #              If the input is a DV1 AVI file it is automatically converted
 #              to a raw .dv file first (original .avi is left untouched).
 #
-#              The original file is renamed to <stem>_original_TIMESTAMP.<ext>
-#              and the trimmed file takes the original filename.
+#              For dvgrab-style _YYYYMMDD_HHMM001 files the trimmed output is
+#              written without the 001 suffix and the original is left untouched.
+#              For other files the original is renamed to
+#              <stem>_original_TIMESTAMP.<ext> and the trimmed file takes its name.
 #
 #              At least one of --start or --end must be specified.
 #
@@ -238,13 +240,34 @@ fi
 FFMPEG_ARGS+=( -c copy )
 
 # ------------------------------------------------------------------------------
-# Rename original and trim into temp file, then promote atomically.
+# Determine output filenames.
+#
+# dvgrab names files with a _YYYYMMDD_HHMM001 suffix (the trailing "001" is a
+# segment counter).  When the input matches that pattern the trimmed file is
+# written directly to the name without the "001", and the original is left
+# untouched — it already has the unique timestamped name dvgrab gave it.
+#
+# For any other input the existing behaviour applies: the original is renamed
+# to <stem>_original_TIMESTAMP.<ext> and the trimmed file takes the original
+# name.
 # ------------------------------------------------------------------------------
 dir=$(dirname "$INPUT")
 base=$(basename "$INPUT")
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-ORIGINAL="${dir}/${base%.*}_original_${TIMESTAMP}.${base##*.}"
-TEMP="${dir}/${base%.*}_trimming.${base##*.}"
+stem="${base%.*}"
+ext="${base##*.}"
+TEMP="${dir}/${stem}_trimming.${ext}"
+
+if [[ "$stem" =~ _[0-9]{8}_[0-9]{4}001$ ]]; then
+    # dvgrab-style name: write trimmed file without the 001 segment suffix.
+    # The original file is left in place with its existing name.
+    TARGET="${dir}/${stem%001}.${ext}"
+    ORIGINAL=""
+else
+    # Generic input: rename original and overwrite with trimmed file.
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    ORIGINAL="${dir}/${stem}_original_${TIMESTAMP}.${ext}"
+    TARGET="${dir}/${stem}.${ext}"
+fi
 
 echo "Input:    $INPUT"
 [[ -n "$START_TIME" ]] && echo "Start:    $START_TIME"
@@ -267,9 +290,11 @@ stdbuf -eL ffmpeg -hide_banner -loglevel warning -stats \
     }'
 echo ""
 
-mv "$INPUT" "$ORIGINAL"
-mv "$TEMP"  "$INPUT"
+if [[ -n "$ORIGINAL" ]]; then
+    mv "$INPUT" "$ORIGINAL"
+fi
+mv "$TEMP" "$TARGET"
 
 echo "Finished: $(date)"
-echo "Trimmed:  $INPUT"
-echo "Original: $ORIGINAL"
+echo "Trimmed:  $TARGET"
+[[ -n "$ORIGINAL" ]] && echo "Original: $ORIGINAL"

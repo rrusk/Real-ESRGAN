@@ -1397,36 +1397,26 @@ local function seek_absolute_both(secs)
 end
 
 -- Seek both by delta seconds.
--- Only the left instance drives this to avoid double-seeking when a key is
--- pressed in the right window (same pattern as nudge/coarse/waypoint).
--- Uses seek_absolute_both() so alignment drift cannot accumulate: the left
--- window's current position is the single reference, and both windows are
--- sent explicit absolute targets rather than independent relative deltas.
+-- Both instances execute the same relative seek independently.  This is
+-- inherently drift-free: both windows receive the same delta simultaneously.
+-- An absolute seek via time-pos query (the approach tried in rev 59) introduces
+-- a race condition: the left window's decode position advances during the IPC
+-- round-trip (~10-100ms), so the right window is sent a stale target and the
+-- two windows accumulate visible drift with every [/] press.
 local function seek_both(delta)
-    if side == "left" then
-        local pos = mp.get_property_number("time-pos") or 0
-        seek_absolute_both(pos + delta)
-    else
-        send_peer(string.format(
-            '{"command":["script-message","dual-seek","%.3f"]}', delta))
-    end
+    mp.commandv("seek", tostring(delta), "relative", "exact")
+    send_peer(string.format('{"command":["seek",%d,"relative","exact"]}', delta))
 end
 
 -- Frame step both.
--- Only the left instance drives this to avoid double-stepping when a key is
--- pressed in the right window (same pattern as seek_both/nudge/coarse).
+-- Both instances execute the step independently (same pattern as seek_both).
 local function frame_step_both(dir)
-    if side == "left" then
-        if dir > 0 then
-            mp.commandv("frame-step")
-            send_peer('{"command":["frame-step"]}')
-        else
-            mp.commandv("frame-back-step")
-            send_peer('{"command":["frame-back-step"]}')
-        end
+    if dir > 0 then
+        mp.commandv("frame-step")
+        send_peer('{"command":["frame-step"]}')
     else
-        send_peer(string.format(
-            '{"command":["script-message","dual-frame-step","%d"]}', dir))
+        mp.commandv("frame-back-step")
+        send_peer('{"command":["frame-back-step"]}')
     end
 end
 
@@ -1566,18 +1556,24 @@ local function coarse_right(dir)
     end
 end
 
--- Key bindings
-mp.add_key_binding("space", "dual-pause",        pause_both)
-mp.add_key_binding("[",     "dual-seek-back",    function() seek_both(-5)  end)
-mp.add_key_binding("]",     "dual-seek-fwd",     function() seek_both(5)   end)
-mp.add_key_binding(",",     "dual-frame-back",   function() frame_step_both(-1) end)
-mp.add_key_binding(".",     "dual-frame-fwd",    function() frame_step_both(1)  end)
-mp.add_key_binding("q",     "dual-quit",         quit_both)
-mp.add_key_binding("a",     "dual-mute-this",    toggle_my_mute)
-mp.add_key_binding("m",     "dual-mute-both",    mute_both)
-mp.add_key_binding("M",     "dual-unmute-both",  unmute_both)
-mp.add_key_binding("n",     "dual-wp-next",      next_waypoint)
-mp.add_key_binding("p",     "dual-wp-prev",      prev_waypoint)
+-- Key bindings.
+-- All dual-control keys use add_forced_key_binding to fully override mpv's
+-- built-in bindings.  Without "force", mpv's default handler fires alongside
+-- the Lua handler, causing the focused window to seek/step independently and
+-- drift out of sync with its peer.  ([ and ] are the most damaging case:
+-- mpv's built-in fires an independent relative seek on the focused window
+-- only, immediately undoing the offset-aware absolute seek we sent to both.)
+mp.add_forced_key_binding("space", "dual-pause",      pause_both)
+mp.add_forced_key_binding("[",  "dual-seek-back",     function() seek_both(-5)  end)
+mp.add_forced_key_binding("]",  "dual-seek-fwd",      function() seek_both(5)   end)
+mp.add_forced_key_binding(",",  "dual-frame-back",    function() frame_step_both(-1) end)
+mp.add_forced_key_binding(".",  "dual-frame-fwd",     function() frame_step_both(1)  end)
+mp.add_forced_key_binding("q",  "dual-quit",          quit_both)
+mp.add_forced_key_binding("a",  "dual-mute-this",     toggle_my_mute)
+mp.add_forced_key_binding("m",  "dual-mute-both",     mute_both)
+mp.add_forced_key_binding("M",  "dual-unmute-both",   unmute_both)
+mp.add_forced_key_binding("n",  "dual-wp-next",       next_waypoint)
+mp.add_forced_key_binding("p",  "dual-wp-prev",       prev_waypoint)
 mp.add_forced_key_binding("z", "dual-nudge-back",  function() nudge_right(-1) end)
 mp.add_forced_key_binding("x", "dual-nudge-fwd",   function() nudge_right(1)  end)
 mp.add_forced_key_binding("Z", "dual-coarse-back", function() coarse_right(-1) end)
@@ -1597,16 +1593,6 @@ end)
 
 mp.register_script_message("dual-wp-prev", function()
     if side == "left" then goto_waypoint(wp_index - 1) end
-end)
-
--- Seek forwarding: right instance forwards to left instance
-mp.register_script_message("dual-seek", function(delta)
-    if side == "left" then seek_both(tonumber(delta)) end
-end)
-
--- Frame step forwarding: right instance forwards to left instance
-mp.register_script_message("dual-frame-step", function(dir)
-    if side == "left" then frame_step_both(tonumber(dir)) end
 end)
 
 -- Nudge forwarding: right instance forwards to left instance

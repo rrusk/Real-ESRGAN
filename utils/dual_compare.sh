@@ -52,6 +52,7 @@
 # Phase 3 controls (mpv):
 #   Space       Pause / resume both
 #   [ / ]       Seek back / forward 5 seconds in both
+#   { / }       Seek back / forward 5 minutes in both
 #   , / .       Step one frame back / forward in both
 #   z / x       Nudge right video back / forward 1 frame (fine alignment)
 #   Z / X       Nudge right video back / forward 2 seconds (coarse, crosses GOP)
@@ -127,7 +128,7 @@ Options:
 
 Phase 3 controls:
   Space   Pause/resume both    [ / ]   Seek ±5s in both
-  , / .   Step one frame       z / x   Nudge right ±1 frame (fine)
+  { / }   Seek ±5min in both   , / .   Step one frame       z / x   Nudge right ±1 frame (fine)
   Z / X   Nudge right ±2s      a       Mute/unmute this window
   m / M   Mute both / Unmute   n / p   Next/prev waypoint
   q       Quit both
@@ -1227,6 +1228,7 @@ echo ""
 echo "  Playback:"
 echo "    Space       Pause / resume both"
 echo "    [ / ]       Seek back / forward 5 seconds in both"
+echo "    { / }       Seek back / forward 5 minutes in both"
 echo "    , / .       Step one frame back / forward in both"
 echo "    z / x       Nudge right (DVD) ±1 frame — fine alignment"
 echo "    Z / X       Seek right (DVD) ±2 seconds — coarse alignment (crosses GOP)"
@@ -1338,6 +1340,20 @@ local right_label = os.getenv("DUAL_RIGHT_LABEL") or "RIGHT"
 local wp_json     = os.getenv("DUAL_WAYPOINTS")   or "[]"
 local offset_secs = tonumber(os.getenv("DUAL_OFFSET") or "0")
 
+-- Anchor-based seek state (left instance only).
+--
+-- fine_disp_secs accumulates the net displacement from [/] (±5s) presses
+-- since the last calibration event.  All fine seeks target
+-- (anchor + fine_disp_secs) absolutely, so frame-snapping errors cannot
+-- compound across many keypresses.
+-- {/} (±300s) coarse jumps use absolute seeks from the current anchor,
+-- updating the anchor after each jump so subsequent presses build from there.
+-- The anchor is initialised from DUAL_LEFT_START / DUAL_RIGHT_START and
+-- reset on any calibration event (nudge, waypoint, coarse jump).
+local anchor_left       = tonumber(os.getenv("DUAL_LEFT_START")  or "0")
+local anchor_right      = tonumber(os.getenv("DUAL_RIGHT_START") or "0")
+local fine_disp_secs    = 0   -- net displacement from [/] (±5s) presses
+
 -- Parse waypoints JSON array [{secs=N, tc=S, label=S}, ...]
 -- Simple parser — expects well-formed output from python3 json.dumps
 local waypoints = {}
@@ -1368,7 +1384,7 @@ local function update_title()
     local wp_hint   = (#waypoints > 0) and ("  wp:" .. wp_index .. "/" .. #waypoints) or ""
     mp.set_property("title",
         my_label() .. mute_hint .. wp_hint ..
-        "  [Space=pause  ,/.=frame  [/]=seek5s  z/x=nudge  Z/X=coarse  a=mute  n/p=wp  q=quit]")
+        "  [Space=pause  ,/.=frame  [/]=seek5s  {/}=seek5m  z/x=nudge  Z/X=coarse  a=mute  n/p=wp  q=quit]")
 end
 
 -- Send a JSON IPC command to the peer socket via socat
@@ -1385,27 +1401,61 @@ end
 -- Left window seeks to secs directly.
 -- Right window seeks to secs + offset_secs (offset already applied at launch
 -- via --start, but absolute seeks must re-apply it explicitly).
+-- Resets both accumulators so subsequent [/]{/} seeks stay drift-free from here.
 local function seek_absolute_both(secs)
     if side == "left" then
-        mp.commandv("seek", tostring(secs), "absolute", "exact")
         local right_secs = secs + offset_secs
+        mp.commandv("seek", tostring(secs), "absolute", "exact")
         send_peer(string.format('{"command":["seek",%.3f,"absolute","exact"]}', right_secs))
+        anchor_left      = secs
+        anchor_right     = right_secs
+        fine_disp_secs   = 0
     else
         -- Right instance: seek to secs (already offset-adjusted by caller)
         mp.commandv("seek", tostring(secs), "absolute", "exact")
     end
 end
 
--- Seek both by delta seconds.
--- Both instances execute the same relative seek independently.  This is
--- inherently drift-free: both windows receive the same delta simultaneously.
--- An absolute seek via time-pos query (the approach tried in rev 59) introduces
--- a race condition: the left window's decode position advances during the IPC
--- round-trip (~10-100ms), so the right window is sent a stale target and the
--- two windows accumulate visible drift with every [/] press.
-local function seek_both(delta)
-    mp.commandv("seek", tostring(delta), "relative", "exact")
-    send_peer(string.format('{"command":["seek",%d,"relative","exact"]}', delta))
+-- seek_fine: [/] keys, ±5s steps.
+-- Accumulates fine_disp_secs from the anchor so frame-snapping errors
+-- cannot compound across many keypresses.
+-- Right instance forwards to left via script-message since left owns the anchor.
+local function seek_fine(delta)
+    if side == "right" then
+        send_peer(string.format(
+            '{"command":["script-message","dual-seek-fine","%d"]}', delta))
+        return
+    end
+    fine_disp_secs = fine_disp_secs + delta
+    local left_target  = math.max(0, anchor_left  + fine_disp_secs)
+    local right_target = math.max(0, anchor_right + fine_disp_secs)
+    mp.commandv("seek", tostring(left_target),  "absolute", "exact")
+    send_peer(string.format('{"command":["seek",%.3f,"absolute","exact"]}', right_target))
+end
+
+-- seek_coarse_jump: {/} keys, ±300s steps.
+-- Uses absolute seeks from the current anchor, same discipline as seek_fine.
+-- After each jump the anchor is updated to the targets just sent, so the next
+-- {/} press builds from there.  fine_disp_secs is also reset so [/] fine
+-- seeks are measured from the new position.
+-- Clamped to [0, duration-1] so seeking past end or before start does not
+-- quit the player.
+local function seek_coarse_jump(delta)
+    if side == "right" then
+        send_peer(string.format(
+            '{"command":["script-message","dual-seek-coarse","%d"]}', delta))
+        return
+    end
+    local duration     = mp.get_property_number("duration") or math.huge
+    local left_target  = math.max(0, math.min(anchor_left  + fine_disp_secs + delta, duration - 1))
+    local right_target = math.max(0, math.min(anchor_right + fine_disp_secs + delta, duration - 1))
+    mp.commandv("seek", tostring(left_target),  "absolute", "exact")
+    send_peer(string.format('{"command":["seek",%.3f,"absolute","exact"]}', right_target))
+    -- Re-calibrate anchor to the targets just sent so subsequent {/} and [/]
+    -- seeks are measured from here, not from the original startup position.
+    anchor_left    = left_target
+    anchor_right   = right_target
+    fine_disp_secs = 0
 end
 
 -- Frame step both.
@@ -1504,12 +1554,8 @@ local frame_period   = 1.0 / 29.97  -- seconds per frame
 -- Nudge right video only by one frame, adjusting the running offset.
 -- Only the left instance drives this to avoid double-nudging.
 -- Pauses both, steps the right video, resumes both.
--- Nudge right video only by one frame to adjust playback sync.
 -- Does NOT modify alignment.json — the blink comparator offset is authoritative.
--- Only the left instance drives this to avoid double-nudging.
--- Nudge right (MPEG-2) video only by one frame to compensate for GOP
--- boundary imprecision after seeking. DV is frame-accurate and stays fixed.
--- Does NOT modify alignment.json — the blink comparator offset is authoritative.
+-- Resets the seek anchor so subsequent [/]{/} seeks stay aligned from this frame.
 local function nudge_right(dir)
     if side == "left" then
         mp.set_property_bool("pause", true)
@@ -1524,6 +1570,16 @@ local function nudge_right(dir)
             send_peer('{"command":["set_property","pause",true]}')
         end)
         offset_secs = offset_secs + (dir * frame_period)
+        -- Re-calibrate anchor: query left position and derive right from new offset.
+        -- We do this after a short delay so the frame-step has settled.
+        mp.add_timeout(0.15, function()
+            local pos = mp.get_property_number("time-pos")
+            if pos then
+                anchor_left  = pos
+                anchor_right = pos + offset_secs
+                fine_disp_secs   = 0
+            end
+        end)
         update_title()
         mp.osd_message(string.format(
             "DVD nudge %s 1 frame (z/x=fine  Z/X=coarse 2s)",
@@ -1536,6 +1592,7 @@ end
 
 -- Coarse seek of right (MPEG-2) window only by 2 seconds.
 -- Crosses GOP boundaries where frame-by-frame nudge gets stuck.
+-- Resets the seek anchor so subsequent [/]{/} seeks stay aligned from here.
 local function coarse_right(dir)
     if side == "left" then
         mp.set_property_bool("pause", true)
@@ -1546,6 +1603,15 @@ local function coarse_right(dir)
             send_peer('{"command":["set_property","pause",true]}')
         end)
         offset_secs = offset_secs + (dir * 2)
+        -- Re-calibrate anchor from current left position and new offset.
+        mp.add_timeout(0.25, function()
+            local pos = mp.get_property_number("time-pos")
+            if pos then
+                anchor_left  = pos
+                anchor_right = pos + offset_secs
+                fine_disp_secs   = 0
+            end
+        end)
         update_title()
         mp.osd_message(string.format(
             "DVD coarse %s 2s (z/x=fine  Z/X=coarse 2s)",
@@ -1564,8 +1630,10 @@ end
 -- mpv's built-in fires an independent relative seek on the focused window
 -- only, immediately undoing the offset-aware absolute seek we sent to both.)
 mp.add_forced_key_binding("space", "dual-pause",      pause_both)
-mp.add_forced_key_binding("[",  "dual-seek-back",     function() seek_both(-5)  end)
-mp.add_forced_key_binding("]",  "dual-seek-fwd",      function() seek_both(5)   end)
+mp.add_forced_key_binding("[",  "dual-seek-back",     function() seek_fine(-5)        end)
+mp.add_forced_key_binding("]",  "dual-seek-fwd",      function() seek_fine(5)         end)
+mp.add_forced_key_binding("{",  "dual-seek-back5m",   function() seek_coarse_jump(-300) end)
+mp.add_forced_key_binding("}",  "dual-seek-fwd5m",    function() seek_coarse_jump(300)  end)
 mp.add_forced_key_binding(",",  "dual-frame-back",    function() frame_step_both(-1) end)
 mp.add_forced_key_binding(".",  "dual-frame-fwd",     function() frame_step_both(1)  end)
 mp.add_forced_key_binding("q",  "dual-quit",          quit_both)
@@ -1593,6 +1661,14 @@ end)
 
 mp.register_script_message("dual-wp-prev", function()
     if side == "left" then goto_waypoint(wp_index - 1) end
+end)
+
+-- Seek forwarding: right instance forwards to left instance which owns the anchor
+mp.register_script_message("dual-seek-fine", function(delta)
+    if side == "left" then seek_fine(tonumber(delta)) end
+end)
+mp.register_script_message("dual-seek-coarse", function(delta)
+    if side == "left" then seek_coarse_jump(tonumber(delta)) end
 end)
 
 -- Nudge forwarding: right instance forwards to left instance
@@ -1716,6 +1792,8 @@ DUAL_LEFT_LABEL="$LEFT_LABEL" \
 DUAL_RIGHT_LABEL="$RIGHT_LABEL" \
 DUAL_WAYPOINTS="$WAYPOINTS_DATA" \
 DUAL_OFFSET="$CONFIRMED_OFFSET" \
+DUAL_LEFT_START="$LEFT_START" \
+DUAL_RIGHT_START="$RIGHT_START" \
 DUAL_RESUME_FILE="$RESUME_JSON" \
 mpv \
     ${SOFTWARE_RENDER:+--vo=x11} \
@@ -1725,6 +1803,7 @@ mpv \
     --geometry="${WIN_W}x${WIN_H}+${LEFT_X}+${SCREEN_Y}" \
     --start="$LEFT_START" \
     --hr-seek=yes \
+    --keep-open=yes \
     --af="lavfi=[pan=stereo|FL=0.5*FL+0.5*FR|FR=0]" \
     ${LEFT_VF:+--vf=$LEFT_VF} \
     --pause \
@@ -1749,6 +1828,7 @@ mpv \
     --geometry="${WIN_W}x${WIN_H}+${RIGHT_X}+${SCREEN_Y}" \
     --start="$RIGHT_START" \
     --hr-seek=yes \
+    --keep-open=yes \
     --af="lavfi=[pan=stereo|FL=0|FR=0.5*FL+0.5*FR]" \
     ${RIGHT_VF:+--vf=$RIGHT_VF} \
     --pause \

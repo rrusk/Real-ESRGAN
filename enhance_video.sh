@@ -133,7 +133,13 @@ if [ "$#" -eq 0 ] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     echo "                       full-resolution progressive frame (~30fps). Lower"
     echo "                       CPU cost and smaller output file."
     echo ""
-    echo "  --threads N          libx264 encoder thread count (default: half of logical CPU"
+    echo "  --preset PRESET      x264 encoding preset (default: slower). Valid values:
+                       ultrafast superfast veryfast faster fast medium
+                       slow slower veryslow placebo
+                       Affects encode speed and file size only — not visual
+                       quality at fixed CRF. Use fast or veryfast for quick
+                       test runs; slower or veryslow for archival encodes.
+  --threads N          libx264 encoder thread count (default: half of logical CPU"
     echo "                       cores, minimum 4, matching video_upscale_pipeline.py)."
     echo "                       Use --threads 0 to let libx264 auto-detect (all cores)."
     echo "  --output-dir DIR     Output directory (default: ~/video_enhance)."
@@ -219,6 +225,7 @@ THREADS=""      # default: auto (half logical cores, min 4); override with --thr
 FORCE_AAC=false
 TEST_MODE=false
 FORCE_60FPS=false
+PRESET="slower"         # default; override with --preset PRESET (ultrafast,superfast,veryfast,faster,fast,medium,slow,slower,veryslow)
 OUTPUT_DIR_OVERRIDE=""  # default: ~/video_enhance; override with --output-dir PATH
 
 _NEXT_IS_PROFILE=false
@@ -227,6 +234,7 @@ _NEXT_IS_CRF=false
 _NEXT_IS_SCALE=false
 _NEXT_IS_THREADS=false
 _NEXT_IS_OUTPUT_DIR=false
+_NEXT_IS_PRESET=false
 
 for arg in "$@"; do
     if [[ "$_NEXT_IS_PROFILE" == true ]]; then
@@ -255,6 +263,7 @@ for arg in "$@"; do
     elif [[ "$_NEXT_IS_OUTPUT_DIR" == true ]]; then
         OUTPUT_DIR_OVERRIDE="$arg"
         _NEXT_IS_OUTPUT_DIR=false
+_NEXT_IS_PRESET=false
     elif [[ "$arg" == "--profile" ]]; then
         _NEXT_IS_PROFILE=true
     elif [[ "$arg" == "--dar" ]]; then
@@ -280,6 +289,11 @@ for arg in "$@"; do
         FORCE_60FPS=true
     elif [[ "$arg" == "--mode0" ]]; then
         BWDIF_MODE=0
+    elif [[ "$_NEXT_IS_PRESET" == true ]]; then
+        PRESET="$arg"
+        _NEXT_IS_PRESET=false
+    elif [[ "$arg" == "--preset" ]]; then
+        _NEXT_IS_PRESET=true
     else
         echo "Error: Unknown argument: $arg"
         echo "Run '$0 --help' for usage."
@@ -306,6 +320,21 @@ else
     THREADS_LABEL="${THREADS_CMD} (auto: half of ${_cpu_count} logical cores, min 4)"
 fi
 echo "[INFO] libx264 threads: $THREADS_LABEL"
+
+# --- 3b. Preset Validation ---
+# Preset affects encode speed and file size only, not visual quality at fixed CRF.
+_VALID_PRESETS="ultrafast superfast veryfast faster fast medium slow slower veryslow placebo"
+if [[ ! " $_VALID_PRESETS " =~ " $PRESET " ]]; then
+    echo "Error: --preset value '$PRESET' is not a valid x264 preset." >&2
+    echo "       Valid values: $_VALID_PRESETS" >&2
+    exit 1
+fi
+PRESET_CMD="$PRESET"
+if [[ "$PRESET" == "slower" ]]; then
+    PRESET_LABEL="slower (default)"
+else
+    PRESET_LABEL="${PRESET} (--preset override)"
+fi
 
 # --- 4. Validate CRF ---
 # Catches non-integer values (e.g. '--crf fast') before ffmpeg sees them,
@@ -1085,6 +1114,7 @@ echo "Upscale:       $([ "$SCALE_FACTOR" -gt 1 ] && echo "${SCALE_FACTOR}x lancz
 echo "Sharpen:       $SHARPEN_LABEL"
 echo "DAR:           $DAR_LABEL"
 echo "CRF:           $CRF_VALUE"
+echo "Preset:        $PRESET_LABEL"
 echo "Threads:       $THREADS_LABEL"
 echo "Audio:         $AUDIO_PLAN"
 if [[ -n "$FFLAGS" ]]; then
@@ -1117,13 +1147,13 @@ echo ""
 #     +genpts: regenerates PTS on decode for sources with broken timestamps.
 #     -t N:    limits how much of the source is read (not just output duration).
 #   -threads 0 lets libx264 auto-detect the optimal thread count for the host.
-#   -preset slower prioritises quality and compression efficiency over speed.
+#   -preset $PRESET_CMD: controls encode speed vs file size. No effect on quality at fixed CRF.
 #   -movflags +faststart is MP4-specific but harmless on MKV (ignored silently).
 
 ffmpeg -y $FFLAGS $LIMIT_CMD -i "$SOURCE_INPUT" \
     -vf "$FILTER_CHAIN" \
     $DAR_CMD \
-    -c:v libx264 -threads "$THREADS_CMD" -crf "$CRF_VALUE" -preset slower \
+    -c:v libx264 -threads "$THREADS_CMD" -crf "$CRF_VALUE" -preset "$PRESET_CMD" \
     -pix_fmt yuv420p \
     -movflags +faststart \
     $AUDIO_CMD \
